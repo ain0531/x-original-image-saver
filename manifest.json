@@ -19,6 +19,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Save image from current X page"
+    "default_title": "X Original Image Saver",
+    "default_popup": "popup.html"
   }
 }

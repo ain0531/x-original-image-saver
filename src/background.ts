@@ -13,6 +13,47 @@ type DownloadCandidate = {
   fileName: string;
 };
 
+type VisibleMediaScanResult = {
+  mode: "all-visible";
+  pageUrl: string;
+  totalImages: number;
+  matchedMediaUrls: string[];
+};
+
+type CurrentTweetScanResult = {
+  mode: "current-tweet";
+  pageUrl: string;
+  matchedMediaUrls: string[];
+  articleCandidates: {
+    index: number;
+    mediaUrls: string[];
+    mediaCount: number;
+  }[];
+  selectedArticleIndex: number | null;
+};
+
+type AutoScrollCollectResult = {
+  pageUrl: string;
+  totalUniqueMediaUrls: string[];
+  rounds: number;
+  elapsedMs: number;
+  endedBy:
+    | "stable"
+    | "max-rounds"
+    | "max-time"
+    | "near-bottom-and-stable"
+    | "no-result";
+};
+
+type SaveStats = {
+  total: number;
+  skipped: number;
+  success: number;
+  failed: number;
+};
+
+const STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+
 function parseMediaUrl(rawUrl: string): ParsedMediaUrl | null {
   try {
     const url = new URL(rawUrl);
@@ -47,29 +88,29 @@ function parseMediaUrl(rawUrl: string): ParsedMediaUrl | null {
   }
 }
 
-async function getMediaUrlsFromPage(tabId: number) {
-  const injectionResults = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const allImgSrcs = Array.from(document.querySelectorAll("img"))
-        .map((img) => img.getAttribute("src"))
-        .filter((src): src is string => Boolean(src));
+function buildMediaIdentityKey(parsed: ParsedMediaUrl): string | null {
+  if (!parsed.format) {
+    return null;
+  }
 
-      const mediaUrls = Array.from(
-        new Set(
-          allImgSrcs.filter((src) => src.includes("pbs.twimg.com/media/"))
-        )
-      );
+  return `${parsed.mediaId}|${parsed.format}`;
+}
 
-      return {
-        pageUrl: location.href,
-        totalImages: allImgSrcs.length,
-        matchedMediaUrls: mediaUrls,
-      };
-    },
+async function getSavedMediaKeys(): Promise<Set<string>> {
+  const result = await chrome.storage.local.get(STORAGE_KEY_SAVED_MEDIA);
+  const raw = result[STORAGE_KEY_SAVED_MEDIA];
+
+  if (!Array.isArray(raw)) {
+    return new Set<string>();
+  }
+
+  return new Set<string>(raw.filter((item): item is string => typeof item === "string"));
+}
+
+async function saveSavedMediaKeys(keys: Set<string>): Promise<void> {
+  await chrome.storage.local.set({
+    [STORAGE_KEY_SAVED_MEDIA]: Array.from(keys),
   });
-
-  return injectionResults[0]?.result ?? null;
 }
 
 function buildDownloadCandidates(parsed: ParsedMediaUrl): DownloadCandidate[] {
@@ -91,22 +132,68 @@ function buildDownloadCandidates(parsed: ParsedMediaUrl): DownloadCandidate[] {
   ];
 }
 
+function addSequenceToFileName(fileName: string, sequence: number): string {
+  const lastDotIndex = fileName.lastIndexOf(".");
+
+  if (lastDotIndex === -1) {
+    return `${fileName}_${sequence}`;
+  }
+
+  const base = fileName.slice(0, lastDotIndex);
+  const ext = fileName.slice(lastDotIndex);
+
+  return `${base}_${sequence}${ext}`;
+}
+
+function resolveUniqueFileName(
+  requestedFileName: string,
+  usedFileNames: Set<string>
+): string {
+  if (!usedFileNames.has(requestedFileName)) {
+    usedFileNames.add(requestedFileName);
+    return requestedFileName;
+  }
+
+  let sequence = 2;
+  while (true) {
+    const candidate = addSequenceToFileName(requestedFileName, sequence);
+
+    if (!usedFileNames.has(candidate)) {
+      usedFileNames.add(candidate);
+      return candidate;
+    }
+
+    sequence += 1;
+  }
+}
+
 async function tryDownloadSequentially(
-  candidates: DownloadCandidate[]
-): Promise<{ success: true; used: DownloadCandidate; downloadId: number } | { success: false }> {
+  candidates: DownloadCandidate[],
+  usedFileNames: Set<string>,
+  saveAs: boolean
+): Promise<
+  | { success: true; used: DownloadCandidate; finalFileName: string; downloadId: number }
+  | { success: false }
+> {
   for (const candidate of candidates) {
+    const finalFileName = resolveUniqueFileName(candidate.fileName, usedFileNames);
+
     try {
-      console.log(`Trying download: ${candidate.quality}`, candidate.url);
+      console.log(
+        `Trying download: quality=${candidate.quality}, requested=${candidate.fileName}, final=${finalFileName}, saveAs=${saveAs}`,
+        candidate.url
+      );
 
       const downloadId = await chrome.downloads.download({
         url: candidate.url,
-        filename: candidate.fileName,
-        saveAs: true,
+        filename: finalFileName,
+        saveAs,
       });
 
       return {
         success: true,
         used: candidate,
+        finalFileName,
         downloadId,
       };
     } catch (error) {
@@ -117,70 +204,427 @@ async function tryDownloadSequentially(
   return { success: false };
 }
 
-chrome.action.onClicked.addListener(async (tab) => {
-  try {
-    if (!tab.id) {
-      console.error("No active tab id.");
-      return;
-    }
+async function getAllVisibleMediaUrlsFromPage(
+  tabId: number
+): Promise<VisibleMediaScanResult | null> {
+  const injectionResults = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const allImgSrcs = Array.from(document.querySelectorAll("img"))
+        .map((img) => img.getAttribute("src"))
+        .filter((src): src is string => Boolean(src));
 
-    if (!tab.url) {
-      console.error("No tab URL.");
-      return;
-    }
-
-    const isTargetPage =
-      tab.url.startsWith("https://x.com/") ||
-      tab.url.startsWith("https://twitter.com/");
-
-    if (!isTargetPage) {
-      console.log("Not an X/Twitter page:", tab.url);
-      return;
-    }
-
-    const result = await getMediaUrlsFromPage(tab.id);
-
-    console.log("Step 14 raw result:", result);
-
-    if (!result || result.matchedMediaUrls.length === 0) {
-      console.log("No pbs.twimg.com/media/ image URLs found on this page.");
-      return;
-    }
-
-    const parsedList = result.matchedMediaUrls
-      .map((url: string) => parseMediaUrl(url))
-      .filter((item): item is ParsedMediaUrl => item !== null);
-
-    if (parsedList.length === 0) {
-      console.log("No parsable media URLs found.");
-      return;
-    }
-
-    console.log(`Found ${parsedList.length} media item(s).`);
-
-    for (const [index, target] of parsedList.entries()) {
-      console.log(`Processing item ${index + 1}/${parsedList.length}:`, target);
-
-      if (!target.format) {
-        console.log("No format found in URL. Skipping for now.", target);
-        continue;
-      }
-
-      const candidates = buildDownloadCandidates(target);
-      const downloadResult = await tryDownloadSequentially(candidates);
-
-      if (!downloadResult.success) {
-        console.error(
-          `Both orig and large download attempts failed for mediaId=${target.mediaId}`
-        );
-        continue;
-      }
-
-      console.log(
-        `Download started successfully for mediaId=${target.mediaId}, quality=${downloadResult.used.quality}, downloadId=${downloadResult.downloadId}`
+      const mediaUrls = Array.from(
+        new Set(
+          allImgSrcs.filter((src) => src.includes("pbs.twimg.com/media/"))
+        )
       );
-    }
-  } catch (error) {
-    console.error("Step 14 failed:", error);
+
+      return {
+        mode: "all-visible" as const,
+        pageUrl: location.href,
+        totalImages: allImgSrcs.length,
+        matchedMediaUrls: mediaUrls,
+      };
+    },
+  });
+
+  return injectionResults[0]?.result ?? null;
+}
+
+async function autoScrollAndCollectVisibleMediaUrls(
+  tabId: number,
+  options?: {
+    scrollRatio?: number;
+    waitMsPerRound?: number;
+    stableRoundsNeeded?: number;
+    maxRounds?: number;
+    maxElapsedMs?: number;
   }
+): Promise<AutoScrollCollectResult> {
+  const scrollRatio = options?.scrollRatio ?? 0.8;
+  const waitMsPerRound = options?.waitMsPerRound ?? 700;
+  const stableRoundsNeeded = options?.stableRoundsNeeded ?? 3;
+  const maxRounds = options?.maxRounds ?? 20;
+  const maxElapsedMs = options?.maxElapsedMs ?? 30000;
+
+  const startedAt = Date.now();
+  const collected = new Set<string>();
+
+  let previousCount = -1;
+  let stableRounds = 0;
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= maxElapsedMs) {
+      console.log(`[autoscroll] stop: max-time at round=${round}`);
+      return {
+        pageUrl: "",
+        totalUniqueMediaUrls: Array.from(collected),
+        rounds: round - 1,
+        elapsedMs,
+        endedBy: "max-time",
+      };
+    }
+
+    const scanResult = await getAllVisibleMediaUrlsFromPage(tabId);
+    const pageUrl = scanResult?.pageUrl ?? "";
+
+    const currentUrls = scanResult?.matchedMediaUrls ?? [];
+    for (const url of currentUrls) {
+      collected.add(url);
+    }
+
+    const currentCount = collected.size;
+
+    const scrollInfoResult = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [scrollRatio],
+      func: (ratio: number) => {
+        const beforeY = window.scrollY;
+        const viewportHeight = window.innerHeight;
+        const scrollAmount = Math.floor(viewportHeight * ratio);
+
+        window.scrollBy(0, scrollAmount);
+
+        const afterY = window.scrollY;
+        const docHeight = document.documentElement.scrollHeight;
+        const nearBottom = afterY + viewportHeight >= docHeight - 50;
+
+        return {
+          beforeY,
+          afterY,
+          viewportHeight,
+          docHeight,
+          nearBottom,
+        };
+      },
+    });
+
+    const scrollInfo = scrollInfoResult[0]?.result as
+      | {
+          beforeY: number;
+          afterY: number;
+          viewportHeight: number;
+          docHeight: number;
+          nearBottom: boolean;
+        }
+      | undefined;
+
+    console.log(
+      `[autoscroll] round=${round}, currentCount=${currentCount}, previousCount=${previousCount}, stableRounds=${stableRounds}, nearBottom=${scrollInfo?.nearBottom}`
+    );
+
+    if (currentCount === previousCount) {
+      stableRounds += 1;
+    } else {
+      stableRounds = 0;
+    }
+
+    previousCount = currentCount;
+
+    if (scrollInfo?.nearBottom && stableRounds >= 2) {
+      console.log(
+        `[autoscroll] stop: near-bottom-and-stable at round=${round}, count=${currentCount}`
+      );
+      return {
+        pageUrl,
+        totalUniqueMediaUrls: Array.from(collected),
+        rounds: round,
+        elapsedMs: Date.now() - startedAt,
+        endedBy: "near-bottom-and-stable",
+      };
+    }
+
+    if (stableRounds >= stableRoundsNeeded) {
+      console.log(
+        `[autoscroll] stop: stable at round=${round}, count=${currentCount}`
+      );
+      return {
+        pageUrl,
+        totalUniqueMediaUrls: Array.from(collected),
+        rounds: round,
+        elapsedMs: Date.now() - startedAt,
+        endedBy: "stable",
+      };
+    }
+
+    if (round < maxRounds) {
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMsPerRound));
+    }
+  }
+
+  console.log("[autoscroll] stop: max-rounds");
+  return {
+    pageUrl: "",
+    totalUniqueMediaUrls: Array.from(collected),
+    rounds: maxRounds,
+    elapsedMs: Date.now() - startedAt,
+    endedBy: "max-rounds",
+  };
+}
+
+async function getCurrentTweetMediaUrlsFromPage(
+  tabId: number
+): Promise<CurrentTweetScanResult | null> {
+  const injectionResults = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const articles = Array.from(document.querySelectorAll("article"));
+
+      const articleCandidates = articles
+        .map((article, index) => {
+          const imgSrcs = Array.from(article.querySelectorAll("img"))
+            .map((img) => img.getAttribute("src"))
+            .filter((src): src is string => Boolean(src));
+
+          const mediaUrls = Array.from(
+            new Set(
+              imgSrcs.filter((src) => src.includes("pbs.twimg.com/media/"))
+            )
+          );
+
+          return {
+            index,
+            mediaUrls,
+            mediaCount: mediaUrls.length,
+          };
+        })
+        .filter((item) => item.mediaCount > 0);
+
+      if (articleCandidates.length === 0) {
+        return {
+          mode: "current-tweet" as const,
+          pageUrl: location.href,
+          matchedMediaUrls: [],
+          articleCandidates: [],
+          selectedArticleIndex: null,
+        };
+      }
+
+      articleCandidates.sort((a, b) => b.mediaCount - a.mediaCount);
+
+      const selected = articleCandidates[0];
+
+      return {
+        mode: "current-tweet" as const,
+        pageUrl: location.href,
+        matchedMediaUrls: selected.mediaUrls,
+        articleCandidates,
+        selectedArticleIndex: selected.index,
+      };
+    },
+  });
+
+  return injectionResults[0]?.result ?? null;
+}
+
+async function saveParsedMediaList(
+  parsedList: ParsedMediaUrl[],
+  saveAs: boolean,
+  options?: {
+    skipPreviouslySaved?: boolean;
+  }
+): Promise<SaveStats> {
+  const stats: SaveStats = {
+    total: parsedList.length,
+    skipped: 0,
+    success: 0,
+    failed: 0,
+  };
+
+  if (parsedList.length === 0) {
+    console.log("No parsable media URLs found.");
+    return stats;
+  }
+
+  console.log(`Found ${parsedList.length} media item(s).`);
+
+  const usedFileNames = new Set<string>();
+  const skipPreviouslySaved = options?.skipPreviouslySaved ?? false;
+
+  let savedKeySet = new Set<string>();
+  if (skipPreviouslySaved) {
+    savedKeySet = await getSavedMediaKeys();
+    console.log(`Loaded ${savedKeySet.size} saved media key(s) from storage.`);
+  }
+
+  const filteredList: ParsedMediaUrl[] = [];
+
+  for (const item of parsedList) {
+    if (!skipPreviouslySaved) {
+      filteredList.push(item);
+      continue;
+    }
+
+    const key = buildMediaIdentityKey(item);
+
+    if (!key) {
+      filteredList.push(item);
+      continue;
+    }
+
+    if (savedKeySet.has(key)) {
+      stats.skipped += 1;
+      console.log(`Skipping already saved media: ${key}`);
+      continue;
+    }
+
+    filteredList.push(item);
+  }
+
+  console.log(
+    `[saveParsedMediaList] total=${stats.total}, skipped=${stats.skipped}, toDownload=${filteredList.length}`
+  );
+
+  for (const [index, target] of filteredList.entries()) {
+    console.log(`Processing item ${index + 1}/${filteredList.length}:`, target);
+
+    if (!target.format) {
+      console.log("No format found in URL. Skipping for now.", target);
+      stats.failed += 1;
+      continue;
+    }
+
+    const candidates = buildDownloadCandidates(target);
+    const downloadResult = await tryDownloadSequentially(
+      candidates,
+      usedFileNames,
+      saveAs
+    );
+
+    if (!downloadResult.success) {
+      console.error(
+        `Both orig and large download attempts failed for mediaId=${target.mediaId}`
+      );
+      stats.failed += 1;
+      continue;
+    }
+
+    if (skipPreviouslySaved) {
+      const key = buildMediaIdentityKey(target);
+      if (key) {
+        savedKeySet.add(key);
+        await saveSavedMediaKeys(savedKeySet);
+        console.log(`Saved media key recorded: ${key}`);
+      }
+    }
+
+    stats.success += 1;
+
+    console.log(
+      `Download started successfully for mediaId=${target.mediaId}, quality=${downloadResult.used.quality}, finalFileName=${downloadResult.finalFileName}, downloadId=${downloadResult.downloadId}`
+    );
+  }
+
+  console.log(
+    `[saveParsedMediaList:done] total=${stats.total}, skipped=${stats.skipped}, success=${stats.success}, failed=${stats.failed}`
+  );
+
+  return stats;
+}
+
+function isTargetXPage(tabUrl: string): boolean {
+  return (
+    tabUrl.startsWith("https://x.com/") ||
+    tabUrl.startsWith("https://twitter.com/")
+  );
+}
+
+async function saveAllVisibleImages(
+  tabId: number,
+  tabUrl: string,
+  saveAs: boolean
+): Promise<SaveStats> {
+  if (!isTargetXPage(tabUrl)) {
+    console.log("Not an X/Twitter page:", tabUrl);
+    return { total: 0, skipped: 0, success: 0, failed: 0 };
+  }
+
+  const collectResult = await autoScrollAndCollectVisibleMediaUrls(tabId, {
+    scrollRatio: 0.8,
+    waitMsPerRound: 700,
+    stableRoundsNeeded: 3,
+    maxRounds: 20,
+    maxElapsedMs: 30000,
+  });
+
+  console.log("Step 24 all-visible collect result:", collectResult);
+
+  if (!collectResult || collectResult.totalUniqueMediaUrls.length === 0) {
+    console.log("No pbs.twimg.com/media/ image URLs collected.");
+    return { total: 0, skipped: 0, success: 0, failed: 0 };
+  }
+
+  const parsedList = collectResult.totalUniqueMediaUrls
+    .map((url: string) => parseMediaUrl(url))
+    .filter((item): item is ParsedMediaUrl => item !== null);
+
+  return await saveParsedMediaList(parsedList, saveAs, {
+    skipPreviouslySaved: true,
+  });
+}
+
+async function saveCurrentTweetImages(
+  tabId: number,
+  tabUrl: string,
+  saveAs: boolean
+): Promise<SaveStats> {
+  if (!isTargetXPage(tabUrl)) {
+    console.log("Not an X/Twitter page:", tabUrl);
+    return { total: 0, skipped: 0, success: 0, failed: 0 };
+  }
+
+  const result = await getCurrentTweetMediaUrlsFromPage(tabId);
+
+  console.log("Step 24 current-tweet raw result:", result);
+
+  if (!result || result.matchedMediaUrls.length === 0) {
+    console.log("No media URLs found for current tweet candidate.");
+    return { total: 0, skipped: 0, success: 0, failed: 0 };
+  }
+
+  const parsedList = result.matchedMediaUrls
+    .map((url: string) => parseMediaUrl(url))
+    .filter((item): item is ParsedMediaUrl => item !== null);
+
+  return await saveParsedMediaList(parsedList, saveAs, {
+    skipPreviouslySaved: false,
+  });
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "SAVE_ALL_VISIBLE_IMAGES") {
+    void saveAllVisibleImages(
+      message.tabId,
+      message.tabUrl,
+      message.saveAs ?? false
+    )
+      .then((stats) => sendResponse({ ok: true, stats }))
+      .catch((error) => {
+        console.error("SAVE_ALL_VISIBLE_IMAGES failed:", error);
+        sendResponse({ ok: false, error: String(error) });
+      });
+
+    return true;
+  }
+
+  if (message?.type === "SAVE_CURRENT_TWEET_IMAGES") {
+    void saveCurrentTweetImages(
+      message.tabId,
+      message.tabUrl,
+      message.saveAs ?? true
+    )
+      .then((stats) => sendResponse({ ok: true, stats }))
+      .catch((error) => {
+        console.error("SAVE_CURRENT_TWEET_IMAGES failed:", error);
+        sendResponse({ ok: false, error: String(error) });
+      });
+
+    return true;
+  }
+
+  return false;
 });
+
+export {};
