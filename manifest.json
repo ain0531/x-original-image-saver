@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "X Original Image Saver",
+  "version": "0.1.0",
+  "description": "Save original-quality images from X.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://pbs.twimg.com/*"
+  ],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Save image from current X page"
+  }
+}
