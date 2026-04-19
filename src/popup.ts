@@ -1,4 +1,5 @@
-const STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+const STORAGE_KEY_SAVED_MEDIA_MAP = "savedMediaMap";
+const LEGACY_STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
 
 type SaveStats = {
   total: number;
@@ -58,14 +59,23 @@ async function getActiveTab(): Promise<chrome.tabs.Tab | null> {
 }
 
 async function getSavedMediaCount(): Promise<number> {
-  const result = await chrome.storage.local.get(STORAGE_KEY_SAVED_MEDIA);
-  const raw = result[STORAGE_KEY_SAVED_MEDIA];
+  const result = await chrome.storage.local.get([
+    STORAGE_KEY_SAVED_MEDIA_MAP,
+    LEGACY_STORAGE_KEY_SAVED_MEDIA,
+  ]);
 
-  if (!Array.isArray(raw)) {
-    return 0;
+  const current = result[STORAGE_KEY_SAVED_MEDIA_MAP];
+  if (current && typeof current === "object" && !Array.isArray(current)) {
+    return Object.keys(current).length;
   }
 
-  return raw.filter((item): item is string => typeof item === "string").length;
+  const legacy = result[LEGACY_STORAGE_KEY_SAVED_MEDIA];
+  if (Array.isArray(legacy)) {
+    return legacy.filter((item): item is string => typeof item === "string")
+      .length;
+  }
+
+  return 0;
 }
 
 saveCurrentTweetButton?.addEventListener("click", async () => {
@@ -139,7 +149,10 @@ clearSavedHistoryButton?.addEventListener("click", async () => {
     return;
   }
 
-  await chrome.storage.local.remove(STORAGE_KEY_SAVED_MEDIA);
+  await chrome.storage.local.remove([
+    STORAGE_KEY_SAVED_MEDIA_MAP,
+    LEGACY_STORAGE_KEY_SAVED_MEDIA,
+  ]);
   setStatus(`Saved history cleared. Removed items: ${count}`);
 });
 

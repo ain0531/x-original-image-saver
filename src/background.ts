@@ -52,7 +52,12 @@ type SaveStats = {
   failed: number;
 };
 
-const STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+type SavedMediaMap = Record<string, number>;
+
+const STORAGE_KEY_SAVED_MEDIA_MAP = "savedMediaMap";
+const LEGACY_STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+const SAVED_MEDIA_KEEP_DAYS = 180;
+const SAVED_MEDIA_KEEP_MS = SAVED_MEDIA_KEEP_DAYS * 24 * 60 * 60 * 1000;
 
 function parseMediaUrl(rawUrl: string): ParsedMediaUrl | null {
   try {
@@ -96,21 +101,79 @@ function buildMediaIdentityKey(parsed: ParsedMediaUrl): string | null {
   return `${parsed.mediaId}|${parsed.format}`;
 }
 
-async function getSavedMediaKeys(): Promise<Set<string>> {
-  const result = await chrome.storage.local.get(STORAGE_KEY_SAVED_MEDIA);
-  const raw = result[STORAGE_KEY_SAVED_MEDIA];
-
-  if (!Array.isArray(raw)) {
-    return new Set<string>();
+function isSavedMediaMap(value: unknown): value is SavedMediaMap {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
   }
 
-  return new Set<string>(raw.filter((item): item is string => typeof item === "string"));
+  return Object.values(value).every((v) => typeof v === "number");
 }
 
-async function saveSavedMediaKeys(keys: Set<string>): Promise<void> {
+async function getSavedMediaMap(): Promise<SavedMediaMap> {
+  const result = await chrome.storage.local.get([
+    STORAGE_KEY_SAVED_MEDIA_MAP,
+    LEGACY_STORAGE_KEY_SAVED_MEDIA,
+  ]);
+
+  const current = result[STORAGE_KEY_SAVED_MEDIA_MAP];
+  if (isSavedMediaMap(current)) {
+    return current;
+  }
+
+  // 旧配列形式からの移行
+  const legacy = result[LEGACY_STORAGE_KEY_SAVED_MEDIA];
+  if (Array.isArray(legacy)) {
+    const now = Date.now();
+    const migrated: SavedMediaMap = {};
+
+    for (const item of legacy) {
+      if (typeof item === "string") {
+        migrated[item] = now;
+      }
+    }
+
+    await chrome.storage.local.set({
+      [STORAGE_KEY_SAVED_MEDIA_MAP]: migrated,
+    });
+    await chrome.storage.local.remove(LEGACY_STORAGE_KEY_SAVED_MEDIA);
+
+    console.log(
+      `[migration] migrated legacy savedMediaKeys -> savedMediaMap (${Object.keys(migrated).length} items)`
+    );
+
+    return migrated;
+  }
+
+  return {};
+}
+
+async function saveSavedMediaMap(map: SavedMediaMap): Promise<void> {
   await chrome.storage.local.set({
-    [STORAGE_KEY_SAVED_MEDIA]: Array.from(keys),
+    [STORAGE_KEY_SAVED_MEDIA_MAP]: map,
   });
+}
+
+function pruneExpiredSavedMediaMap(
+  map: SavedMediaMap,
+  now: number = Date.now()
+): { prunedMap: SavedMediaMap; removedCount: number } {
+  const cutoff = now - SAVED_MEDIA_KEEP_MS;
+  const prunedMap: SavedMediaMap = {};
+  let removedCount = 0;
+
+  for (const [key, savedAt] of Object.entries(map)) {
+    if (savedAt >= cutoff) {
+      prunedMap[key] = savedAt;
+    } else {
+      removedCount += 1;
+    }
+  }
+
+  return { prunedMap, removedCount };
+}
+
+function countSavedMediaMap(map: SavedMediaMap): number {
+  return Object.keys(map).length;
 }
 
 function buildDownloadCandidates(parsed: ParsedMediaUrl): DownloadCandidate[] {
@@ -443,10 +506,24 @@ async function saveParsedMediaList(
   const usedFileNames = new Set<string>();
   const skipPreviouslySaved = options?.skipPreviouslySaved ?? false;
 
-  let savedKeySet = new Set<string>();
+  let savedMediaMap: SavedMediaMap = {};
+  let savedMediaMapDirty = false;
+
   if (skipPreviouslySaved) {
-    savedKeySet = await getSavedMediaKeys();
-    console.log(`Loaded ${savedKeySet.size} saved media key(s) from storage.`);
+    const loadedMap = await getSavedMediaMap();
+    const { prunedMap, removedCount } = pruneExpiredSavedMediaMap(loadedMap);
+
+    savedMediaMap = prunedMap;
+    if (removedCount > 0) {
+      savedMediaMapDirty = true;
+      console.log(
+        `[savedMediaMap] removed expired records: ${removedCount}, remaining=${countSavedMediaMap(savedMediaMap)}`
+      );
+    } else {
+      console.log(
+        `[savedMediaMap] loaded records: ${countSavedMediaMap(savedMediaMap)}`
+      );
+    }
   }
 
   const filteredList: ParsedMediaUrl[] = [];
@@ -464,7 +541,7 @@ async function saveParsedMediaList(
       continue;
     }
 
-    if (savedKeySet.has(key)) {
+    if (savedMediaMap[key] !== undefined) {
       stats.skipped += 1;
       console.log(`Skipping already saved media: ${key}`);
       continue;
@@ -504,9 +581,9 @@ async function saveParsedMediaList(
     if (skipPreviouslySaved) {
       const key = buildMediaIdentityKey(target);
       if (key) {
-        savedKeySet.add(key);
-        await saveSavedMediaKeys(savedKeySet);
-        console.log(`Saved media key recorded: ${key}`);
+        savedMediaMap[key] = Date.now();
+        savedMediaMapDirty = true;
+        console.log(`Saved media key recorded/updated: ${key}`);
       }
     }
 
@@ -514,6 +591,13 @@ async function saveParsedMediaList(
 
     console.log(
       `Download started successfully for mediaId=${target.mediaId}, quality=${downloadResult.used.quality}, finalFileName=${downloadResult.finalFileName}, downloadId=${downloadResult.downloadId}`
+    );
+  }
+
+  if (skipPreviouslySaved && savedMediaMapDirty) {
+    await saveSavedMediaMap(savedMediaMap);
+    console.log(
+      `[savedMediaMap] persisted records: ${countSavedMediaMap(savedMediaMap)}`
     );
   }
 
@@ -549,7 +633,7 @@ async function saveAllVisibleImages(
     maxElapsedMs: 30000,
   });
 
-  console.log("Step 24 all-visible collect result:", collectResult);
+  console.log("Step 25 all-visible collect result:", collectResult);
 
   if (!collectResult || collectResult.totalUniqueMediaUrls.length === 0) {
     console.log("No pbs.twimg.com/media/ image URLs collected.");
@@ -577,7 +661,7 @@ async function saveCurrentTweetImages(
 
   const result = await getCurrentTweetMediaUrlsFromPage(tabId);
 
-  console.log("Step 24 current-tweet raw result:", result);
+  console.log("Step 25 current-tweet raw result:", result);
 
   if (!result || result.matchedMediaUrls.length === 0) {
     console.log("No media URLs found for current tweet candidate.");
