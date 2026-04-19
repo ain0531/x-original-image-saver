@@ -1,10 +1,14 @@
-const STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+const STORAGE_KEY_SAVED_MEDIA_MAP = "savedMediaMap";
+const LEGACY_STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+const SAVED_MEDIA_KEEP_DAYS = 180;
+const SAVED_MEDIA_KEEP_MS = SAVED_MEDIA_KEEP_DAYS * 24 * 60 * 60 * 1000;
 function parseMediaUrl(rawUrl) {
     try {
         const url = new URL(rawUrl);
         const pathMatch = url.pathname.match(/\/media\/([^/?]+)/);
         const mediaId = pathMatch?.[1] ?? null;
         if (!mediaId) {
+            console.warn("[parseMediaUrl] mediaId not found:", rawUrl);
             return null;
         }
         const format = url.searchParams.get("format");
@@ -13,7 +17,7 @@ function parseMediaUrl(rawUrl) {
         orig.searchParams.set("name", "orig");
         const large = new URL(url.toString());
         large.searchParams.set("name", "large");
-        return {
+        const parsed = {
             originalUrl: rawUrl,
             mediaId,
             format,
@@ -21,6 +25,8 @@ function parseMediaUrl(rawUrl) {
             origUrl: orig.toString(),
             largeUrl: large.toString(),
         };
+        console.log("[parseMediaUrl] parsed:", parsed);
+        return parsed;
     }
     catch (error) {
         console.error("Failed to parse media URL:", rawUrl, error);
@@ -29,28 +35,74 @@ function parseMediaUrl(rawUrl) {
 }
 function buildMediaIdentityKey(parsed) {
     if (!parsed.format) {
+        console.warn("[buildMediaIdentityKey] format missing:", parsed);
         return null;
     }
     return `${parsed.mediaId}|${parsed.format}`;
 }
-async function getSavedMediaKeys() {
-    const result = await chrome.storage.local.get(STORAGE_KEY_SAVED_MEDIA);
-    const raw = result[STORAGE_KEY_SAVED_MEDIA];
-    if (!Array.isArray(raw)) {
-        return new Set();
+function isSavedMediaMap(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false;
     }
-    return new Set(raw.filter((item) => typeof item === "string"));
+    return Object.values(value).every((v) => typeof v === "number");
 }
-async function saveSavedMediaKeys(keys) {
+async function getSavedMediaMap() {
+    const result = await chrome.storage.local.get([
+        STORAGE_KEY_SAVED_MEDIA_MAP,
+        LEGACY_STORAGE_KEY_SAVED_MEDIA,
+    ]);
+    const current = result[STORAGE_KEY_SAVED_MEDIA_MAP];
+    if (isSavedMediaMap(current)) {
+        console.log(`[getSavedMediaMap] current map loaded: ${Object.keys(current).length} item(s)`);
+        return current;
+    }
+    const legacy = result[LEGACY_STORAGE_KEY_SAVED_MEDIA];
+    if (Array.isArray(legacy)) {
+        const now = Date.now();
+        const migrated = {};
+        for (const item of legacy) {
+            if (typeof item === "string") {
+                migrated[item] = now;
+            }
+        }
+        await chrome.storage.local.set({
+            [STORAGE_KEY_SAVED_MEDIA_MAP]: migrated,
+        });
+        await chrome.storage.local.remove(LEGACY_STORAGE_KEY_SAVED_MEDIA);
+        console.log(`[migration] migrated legacy savedMediaKeys -> savedMediaMap (${Object.keys(migrated).length} items)`);
+        return migrated;
+    }
+    console.log("[getSavedMediaMap] no saved map found, using empty map");
+    return {};
+}
+async function saveSavedMediaMap(map) {
     await chrome.storage.local.set({
-        [STORAGE_KEY_SAVED_MEDIA]: Array.from(keys),
+        [STORAGE_KEY_SAVED_MEDIA_MAP]: map,
     });
+}
+function pruneExpiredSavedMediaMap(map, now = Date.now()) {
+    const cutoff = now - SAVED_MEDIA_KEEP_MS;
+    const prunedMap = {};
+    let removedCount = 0;
+    for (const [key, savedAt] of Object.entries(map)) {
+        if (savedAt >= cutoff) {
+            prunedMap[key] = savedAt;
+        }
+        else {
+            removedCount += 1;
+        }
+    }
+    return { prunedMap, removedCount };
+}
+function countSavedMediaMap(map) {
+    return Object.keys(map).length;
 }
 function buildDownloadCandidates(parsed) {
     if (!parsed.format) {
+        console.warn("[buildDownloadCandidates] format missing:", parsed);
         return [];
     }
-    return [
+    const candidates = [
         {
             url: parsed.origUrl,
             quality: "orig",
@@ -62,6 +114,8 @@ function buildDownloadCandidates(parsed) {
             fileName: `${parsed.mediaId}_large.${parsed.format}`,
         },
     ];
+    console.log("[buildDownloadCandidates] candidates:", candidates);
+    return candidates;
 }
 function addSequenceToFileName(fileName, sequence) {
     const lastDotIndex = fileName.lastIndexOf(".");
@@ -88,6 +142,7 @@ function resolveUniqueFileName(requestedFileName, usedFileNames) {
     }
 }
 async function tryDownloadSequentially(candidates, usedFileNames, saveAs) {
+    console.log(`[tryDownloadSequentially] start: candidates=${candidates.length}, saveAs=${saveAs}`);
     for (const candidate of candidates) {
         const finalFileName = resolveUniqueFileName(candidate.fileName, usedFileNames);
         try {
@@ -97,6 +152,7 @@ async function tryDownloadSequentially(candidates, usedFileNames, saveAs) {
                 filename: finalFileName,
                 saveAs,
             });
+            console.log(`[tryDownloadSequentially] accepted: quality=${candidate.quality}, finalFileName=${finalFileName}, downloadId=${downloadId}`);
             return {
                 success: true,
                 used: candidate,
@@ -108,6 +164,7 @@ async function tryDownloadSequentially(candidates, usedFileNames, saveAs) {
             console.warn(`Download failed with ${candidate.quality}:`, error);
         }
     }
+    console.warn("[tryDownloadSequentially] all candidates failed");
     return { success: false };
 }
 async function getAllVisibleMediaUrlsFromPage(tabId) {
@@ -126,7 +183,9 @@ async function getAllVisibleMediaUrlsFromPage(tabId) {
             };
         },
     });
-    return injectionResults[0]?.result ?? null;
+    const result = injectionResults[0]?.result ?? null;
+    console.log("[getAllVisibleMediaUrlsFromPage] result:", result);
+    return result;
 }
 async function autoScrollAndCollectVisibleMediaUrls(tabId, options) {
     const scrollRatio = options?.scrollRatio ?? 0.8;
@@ -134,6 +193,13 @@ async function autoScrollAndCollectVisibleMediaUrls(tabId, options) {
     const stableRoundsNeeded = options?.stableRoundsNeeded ?? 3;
     const maxRounds = options?.maxRounds ?? 20;
     const maxElapsedMs = options?.maxElapsedMs ?? 30000;
+    console.log("[autoScrollAndCollectVisibleMediaUrls] options:", {
+        scrollRatio,
+        waitMsPerRound,
+        stableRoundsNeeded,
+        maxRounds,
+        maxElapsedMs,
+    });
     const startedAt = Date.now();
     const collected = new Set();
     let previousCount = -1;
@@ -257,7 +323,9 @@ async function getCurrentTweetMediaUrlsFromPage(tabId) {
             };
         },
     });
-    return injectionResults[0]?.result ?? null;
+    const result = injectionResults[0]?.result ?? null;
+    console.log("[getCurrentTweetMediaUrlsFromPage] result:", result);
+    return result;
 }
 async function saveParsedMediaList(parsedList, saveAs, options) {
     const stats = {
@@ -266,6 +334,12 @@ async function saveParsedMediaList(parsedList, saveAs, options) {
         success: 0,
         failed: 0,
     };
+    console.log("[saveParsedMediaList] start:", {
+        parsedListLength: parsedList.length,
+        saveAs,
+        skipPreviouslySaved: options?.skipPreviouslySaved ?? false,
+        parsedList,
+    });
     if (parsedList.length === 0) {
         console.log("No parsable media URLs found.");
         return stats;
@@ -273,10 +347,19 @@ async function saveParsedMediaList(parsedList, saveAs, options) {
     console.log(`Found ${parsedList.length} media item(s).`);
     const usedFileNames = new Set();
     const skipPreviouslySaved = options?.skipPreviouslySaved ?? false;
-    let savedKeySet = new Set();
+    let savedMediaMap = {};
+    let savedMediaMapDirty = false;
     if (skipPreviouslySaved) {
-        savedKeySet = await getSavedMediaKeys();
-        console.log(`Loaded ${savedKeySet.size} saved media key(s) from storage.`);
+        const loadedMap = await getSavedMediaMap();
+        const { prunedMap, removedCount } = pruneExpiredSavedMediaMap(loadedMap);
+        savedMediaMap = prunedMap;
+        if (removedCount > 0) {
+            savedMediaMapDirty = true;
+            console.log(`[savedMediaMap] removed expired records: ${removedCount}, remaining=${countSavedMediaMap(savedMediaMap)}`);
+        }
+        else {
+            console.log(`[savedMediaMap] loaded records: ${countSavedMediaMap(savedMediaMap)}`);
+        }
     }
     const filteredList = [];
     for (const item of parsedList) {
@@ -286,17 +369,20 @@ async function saveParsedMediaList(parsedList, saveAs, options) {
         }
         const key = buildMediaIdentityKey(item);
         if (!key) {
+            console.log("[saveParsedMediaList] no identity key, keep target:", item);
             filteredList.push(item);
             continue;
         }
-        if (savedKeySet.has(key)) {
+        if (savedMediaMap[key] !== undefined) {
             stats.skipped += 1;
             console.log(`Skipping already saved media: ${key}`);
             continue;
         }
+        console.log(`[saveParsedMediaList] not found in saved map, keep: ${key}`);
         filteredList.push(item);
     }
     console.log(`[saveParsedMediaList] total=${stats.total}, skipped=${stats.skipped}, toDownload=${filteredList.length}`);
+    console.log("[saveParsedMediaList] filteredList:", filteredList);
     for (const [index, target] of filteredList.entries()) {
         console.log(`Processing item ${index + 1}/${filteredList.length}:`, target);
         if (!target.format) {
@@ -314,13 +400,17 @@ async function saveParsedMediaList(parsedList, saveAs, options) {
         if (skipPreviouslySaved) {
             const key = buildMediaIdentityKey(target);
             if (key) {
-                savedKeySet.add(key);
-                await saveSavedMediaKeys(savedKeySet);
-                console.log(`Saved media key recorded: ${key}`);
+                savedMediaMap[key] = Date.now();
+                savedMediaMapDirty = true;
+                console.log(`Saved media key recorded/updated: ${key}`);
             }
         }
         stats.success += 1;
         console.log(`Download started successfully for mediaId=${target.mediaId}, quality=${downloadResult.used.quality}, finalFileName=${downloadResult.finalFileName}, downloadId=${downloadResult.downloadId}`);
+    }
+    if (skipPreviouslySaved && savedMediaMapDirty) {
+        await saveSavedMediaMap(savedMediaMap);
+        console.log(`[savedMediaMap] persisted records: ${countSavedMediaMap(savedMediaMap)}`);
     }
     console.log(`[saveParsedMediaList:done] total=${stats.total}, skipped=${stats.skipped}, success=${stats.success}, failed=${stats.failed}`);
     return stats;
@@ -329,52 +419,65 @@ function isTargetXPage(tabUrl) {
     return (tabUrl.startsWith("https://x.com/") ||
         tabUrl.startsWith("https://twitter.com/"));
 }
-async function saveAllVisibleImages(tabId, tabUrl, saveAs) {
+async function saveAllVisibleImages(tabId, tabUrl, saveAs, scrollSettings, skipPreviouslySaved = true) {
+    console.log("[saveAllVisibleImages] start:", {
+        tabId,
+        tabUrl,
+        saveAs,
+        scrollSettings,
+        skipPreviouslySaved,
+    });
     if (!isTargetXPage(tabUrl)) {
         console.log("Not an X/Twitter page:", tabUrl);
         return { total: 0, skipped: 0, success: 0, failed: 0 };
     }
-    const collectResult = await autoScrollAndCollectVisibleMediaUrls(tabId, {
-        scrollRatio: 0.8,
-        waitMsPerRound: 700,
-        stableRoundsNeeded: 3,
-        maxRounds: 20,
-        maxElapsedMs: 30000,
-    });
-    console.log("Step 24 all-visible collect result:", collectResult);
+    const collectResult = await autoScrollAndCollectVisibleMediaUrls(tabId, scrollSettings);
+    console.log("[saveAllVisibleImages] collectResult:", collectResult);
     if (!collectResult || collectResult.totalUniqueMediaUrls.length === 0) {
         console.log("No pbs.twimg.com/media/ image URLs collected.");
         return { total: 0, skipped: 0, success: 0, failed: 0 };
     }
-    const parsedList = collectResult.totalUniqueMediaUrls
-        .map((url) => parseMediaUrl(url))
-        .filter((item) => item !== null);
+    const parsedCandidates = collectResult.totalUniqueMediaUrls.map((url) => parseMediaUrl(url));
+    console.log("[saveAllVisibleImages] parsedCandidates:", parsedCandidates);
+    const parsedList = parsedCandidates.filter((item) => item !== null);
+    console.log("[saveAllVisibleImages] parsedList length:", parsedList.length);
     return await saveParsedMediaList(parsedList, saveAs, {
-        skipPreviouslySaved: true,
+        skipPreviouslySaved,
     });
 }
-async function saveCurrentTweetImages(tabId, tabUrl, saveAs) {
+async function saveCurrentTweetImages(tabId, tabUrl, saveAs, skipPreviouslySaved = true) {
+    console.log("[saveCurrentTweetImages] start:", {
+        tabId,
+        tabUrl,
+        saveAs,
+        skipPreviouslySaved,
+    });
     if (!isTargetXPage(tabUrl)) {
         console.log("Not an X/Twitter page:", tabUrl);
         return { total: 0, skipped: 0, success: 0, failed: 0 };
     }
     const result = await getCurrentTweetMediaUrlsFromPage(tabId);
-    console.log("Step 24 current-tweet raw result:", result);
+    console.log("[saveCurrentTweetImages] raw result:", result);
     if (!result || result.matchedMediaUrls.length === 0) {
         console.log("No media URLs found for current tweet candidate.");
         return { total: 0, skipped: 0, success: 0, failed: 0 };
     }
-    const parsedList = result.matchedMediaUrls
-        .map((url) => parseMediaUrl(url))
-        .filter((item) => item !== null);
+    const parsedCandidates = result.matchedMediaUrls.map((url) => parseMediaUrl(url));
+    console.log("[saveCurrentTweetImages] parsedCandidates:", parsedCandidates);
+    const parsedList = parsedCandidates.filter((item) => item !== null);
+    console.log("[saveCurrentTweetImages] parsedList length:", parsedList.length);
     return await saveParsedMediaList(parsedList, saveAs, {
-        skipPreviouslySaved: false,
+        skipPreviouslySaved,
     });
 }
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    console.log("[onMessage] received:", message);
     if (message?.type === "SAVE_ALL_VISIBLE_IMAGES") {
-        void saveAllVisibleImages(message.tabId, message.tabUrl, message.saveAs ?? false)
-            .then((stats) => sendResponse({ ok: true, stats }))
+        void saveAllVisibleImages(message.tabId, message.tabUrl, message.saveAs ?? false, message.scrollSettings, message.skipPreviouslySaved ?? true)
+            .then((stats) => {
+            console.log("[onMessage] SAVE_ALL_VISIBLE_IMAGES stats:", stats);
+            sendResponse({ ok: true, stats });
+        })
             .catch((error) => {
             console.error("SAVE_ALL_VISIBLE_IMAGES failed:", error);
             sendResponse({ ok: false, error: String(error) });
@@ -382,8 +485,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return true;
     }
     if (message?.type === "SAVE_CURRENT_TWEET_IMAGES") {
-        void saveCurrentTweetImages(message.tabId, message.tabUrl, message.saveAs ?? true)
-            .then((stats) => sendResponse({ ok: true, stats }))
+        void saveCurrentTweetImages(message.tabId, message.tabUrl, message.saveAs ?? true, message.skipPreviouslySaved ?? true)
+            .then((stats) => {
+            console.log("[onMessage] SAVE_CURRENT_TWEET_IMAGES stats:", stats);
+            sendResponse({ ok: true, stats });
+        })
             .catch((error) => {
             console.error("SAVE_CURRENT_TWEET_IMAGES failed:", error);
             sendResponse({ ok: false, error: String(error) });

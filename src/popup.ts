@@ -1,5 +1,6 @@
 const STORAGE_KEY_SAVED_MEDIA_MAP = "savedMediaMap";
 const LEGACY_STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+const STORAGE_KEY_SCROLL_SETTINGS = "allVisibleScrollSettings";
 
 type SaveStats = {
   total: number;
@@ -18,6 +19,22 @@ type SaveResponse =
       error?: string;
     };
 
+type AllVisibleScrollSettings = {
+  scrollRatio: number;
+  waitSecondsPerRound: number;
+  stableRoundsNeeded: number;
+  maxRounds: number;
+  maxElapsedSeconds: number;
+};
+
+const DEFAULT_SCROLL_SETTINGS: AllVisibleScrollSettings = {
+  scrollRatio: 0.8,
+  waitSecondsPerRound: 0.7,
+  stableRoundsNeeded: 3,
+  maxRounds: 20,
+  maxElapsedSeconds: 30,
+};
+
 const saveCurrentTweetButton = document.getElementById(
   "save-current-tweet"
 ) as HTMLButtonElement | null;
@@ -30,7 +47,35 @@ const clearSavedHistoryButton = document.getElementById(
   "clear-saved-history"
 ) as HTMLButtonElement | null;
 
+const checkCurrentSavedListInput = document.getElementById(
+  "check-current-saved-list"
+) as HTMLInputElement | null;
+
+const checkAllSavedListInput = document.getElementById(
+  "check-all-saved-list"
+) as HTMLInputElement | null;
+
 const statusElement = document.getElementById("status") as HTMLDivElement | null;
+
+const scrollRatioInput = document.getElementById(
+  "scroll-ratio"
+) as HTMLInputElement | null;
+
+const waitSecondsPerRoundInput = document.getElementById(
+  "wait-seconds-per-round"
+) as HTMLInputElement | null;
+
+const stableRoundsNeededInput = document.getElementById(
+  "stable-rounds-needed"
+) as HTMLInputElement | null;
+
+const maxRoundsInput = document.getElementById(
+  "max-rounds"
+) as HTMLInputElement | null;
+
+const maxElapsedSecondsInput = document.getElementById(
+  "max-elapsed-seconds"
+) as HTMLInputElement | null;
 
 function setStatus(message: string): void {
   if (statusElement) {
@@ -47,6 +92,115 @@ function formatStats(title: string, stats: SaveStats): string {
     `Downloaded: ${stats.success}`,
     `Failed: ${stats.failed}`,
   ].join("\n");
+}
+
+function normalizeScrollSettings(value: unknown): AllVisibleScrollSettings {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ...DEFAULT_SCROLL_SETTINGS };
+  }
+
+  const candidate = value as Partial<AllVisibleScrollSettings>;
+
+  return {
+    scrollRatio:
+      typeof candidate.scrollRatio === "number"
+        ? candidate.scrollRatio
+        : DEFAULT_SCROLL_SETTINGS.scrollRatio,
+    waitSecondsPerRound:
+      typeof candidate.waitSecondsPerRound === "number"
+        ? candidate.waitSecondsPerRound
+        : DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound,
+    stableRoundsNeeded:
+      typeof candidate.stableRoundsNeeded === "number"
+        ? candidate.stableRoundsNeeded
+        : DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded,
+    maxRounds:
+      typeof candidate.maxRounds === "number"
+        ? candidate.maxRounds
+        : DEFAULT_SCROLL_SETTINGS.maxRounds,
+    maxElapsedSeconds:
+      typeof candidate.maxElapsedSeconds === "number"
+        ? candidate.maxElapsedSeconds
+        : DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds,
+  };
+}
+
+async function getStoredScrollSettings(): Promise<AllVisibleScrollSettings> {
+  const result = await chrome.storage.local.get(STORAGE_KEY_SCROLL_SETTINGS);
+  return normalizeScrollSettings(result[STORAGE_KEY_SCROLL_SETTINGS]);
+}
+
+async function saveScrollSettings(
+  settings: AllVisibleScrollSettings
+): Promise<void> {
+  await chrome.storage.local.set({
+    [STORAGE_KEY_SCROLL_SETTINGS]: settings,
+  });
+}
+
+function applyScrollSettingsToInputs(
+  settings: AllVisibleScrollSettings
+): void {
+  if (scrollRatioInput) {
+    scrollRatioInput.value = String(settings.scrollRatio);
+  }
+
+  if (waitSecondsPerRoundInput) {
+    waitSecondsPerRoundInput.value = String(settings.waitSecondsPerRound);
+  }
+
+  if (stableRoundsNeededInput) {
+    stableRoundsNeededInput.value = String(settings.stableRoundsNeeded);
+  }
+
+  if (maxRoundsInput) {
+    maxRoundsInput.value = String(settings.maxRounds);
+  }
+
+  if (maxElapsedSecondsInput) {
+    maxElapsedSecondsInput.value = String(settings.maxElapsedSeconds);
+  }
+}
+
+function parsePositiveNumber(value: string, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function readScrollSettingsFromInputs(): AllVisibleScrollSettings {
+  return {
+    scrollRatio: parsePositiveNumber(
+      scrollRatioInput?.value ?? "",
+      DEFAULT_SCROLL_SETTINGS.scrollRatio
+    ),
+    waitSecondsPerRound: parsePositiveNumber(
+      waitSecondsPerRoundInput?.value ?? "",
+      DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound
+    ),
+    stableRoundsNeeded: Math.floor(
+      parsePositiveNumber(
+        stableRoundsNeededInput?.value ?? "",
+        DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded
+      )
+    ),
+    maxRounds: Math.floor(
+      parsePositiveNumber(
+        maxRoundsInput?.value ?? "",
+        DEFAULT_SCROLL_SETTINGS.maxRounds
+      )
+    ),
+    maxElapsedSeconds: parsePositiveNumber(
+      maxElapsedSecondsInput?.value ?? "",
+      DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds
+    ),
+  };
+}
+
+async function persistScrollSettingsFromInputs(): Promise<AllVisibleScrollSettings> {
+  const settings = readScrollSettingsFromInputs();
+  await saveScrollSettings(settings);
+  applyScrollSettingsToInputs(settings);
+  return settings;
 }
 
 async function getActiveTab(): Promise<chrome.tabs.Tab | null> {
@@ -78,6 +232,19 @@ async function getSavedMediaCount(): Promise<number> {
   return 0;
 }
 
+async function initializePopup(): Promise<void> {
+  const storedSettings = await getStoredScrollSettings();
+  applyScrollSettingsToInputs(storedSettings);
+
+  if (checkCurrentSavedListInput) {
+    checkCurrentSavedListInput.checked = true;
+  }
+
+  if (checkAllSavedListInput) {
+    checkAllSavedListInput.checked = true;
+  }
+}
+
 saveCurrentTweetButton?.addEventListener("click", async () => {
   const activeTab = await getActiveTab();
 
@@ -93,6 +260,7 @@ saveCurrentTweetButton?.addEventListener("click", async () => {
     tabId: activeTab.id,
     tabUrl: activeTab.url ?? "",
     saveAs: true,
+    skipPreviouslySaved: checkCurrentSavedListInput?.checked ?? true,
   })) as SaveResponse;
 
   if (!response.ok) {
@@ -120,6 +288,8 @@ saveAllVisibleButton?.addEventListener("click", async () => {
     return;
   }
 
+  const scrollSettings = await persistScrollSettingsFromInputs();
+
   setStatus("Auto-scrolling scan started...");
 
   const response = (await chrome.runtime.sendMessage({
@@ -127,6 +297,14 @@ saveAllVisibleButton?.addEventListener("click", async () => {
     tabId: activeTab.id,
     tabUrl: activeTab.url ?? "",
     saveAs: false,
+    skipPreviouslySaved: checkAllSavedListInput?.checked ?? true,
+    scrollSettings: {
+      scrollRatio: scrollSettings.scrollRatio,
+      waitMsPerRound: Math.round(scrollSettings.waitSecondsPerRound * 1000),
+      stableRoundsNeeded: scrollSettings.stableRoundsNeeded,
+      maxRounds: scrollSettings.maxRounds,
+      maxElapsedMs: Math.round(scrollSettings.maxElapsedSeconds * 1000),
+    },
   })) as SaveResponse;
 
   if (!response.ok) {
@@ -155,5 +333,7 @@ clearSavedHistoryButton?.addEventListener("click", async () => {
   ]);
   setStatus(`Saved history cleared. Removed items: ${count}`);
 });
+
+void initializePopup();
 
 export {};
