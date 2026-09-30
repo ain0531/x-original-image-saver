@@ -39,22 +39,14 @@ function normalizeScrollSettings(value) {
         return { ...DEFAULT_SCROLL_SETTINGS };
     }
     const candidate = value;
+    const positive = (value, fallback, max) => typeof value === "number" && Number.isFinite(value) && value > 0
+        ? Math.min(value, max) : fallback;
     return {
-        scrollRatio: typeof candidate.scrollRatio === "number"
-            ? candidate.scrollRatio
-            : DEFAULT_SCROLL_SETTINGS.scrollRatio,
-        waitSecondsPerRound: typeof candidate.waitSecondsPerRound === "number"
-            ? candidate.waitSecondsPerRound
-            : DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound,
-        stableRoundsNeeded: typeof candidate.stableRoundsNeeded === "number"
-            ? candidate.stableRoundsNeeded
-            : DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded,
-        maxRounds: typeof candidate.maxRounds === "number"
-            ? candidate.maxRounds
-            : DEFAULT_SCROLL_SETTINGS.maxRounds,
-        maxElapsedSeconds: typeof candidate.maxElapsedSeconds === "number"
-            ? candidate.maxElapsedSeconds
-            : DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds,
+        scrollRatio: positive(candidate.scrollRatio, DEFAULT_SCROLL_SETTINGS.scrollRatio, 1),
+        waitSecondsPerRound: positive(candidate.waitSecondsPerRound, DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound, 10),
+        stableRoundsNeeded: Math.max(1, Math.floor(positive(candidate.stableRoundsNeeded, DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded, 100))),
+        maxRounds: Math.max(1, Math.floor(positive(candidate.maxRounds, DEFAULT_SCROLL_SETTINGS.maxRounds, 1000))),
+        maxElapsedSeconds: positive(candidate.maxElapsedSeconds, DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds, 300),
     };
 }
 async function getStoredScrollSettings() {
@@ -88,13 +80,13 @@ function parsePositiveNumber(value, fallback) {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 function readScrollSettingsFromInputs() {
-    return {
+    return normalizeScrollSettings({
         scrollRatio: parsePositiveNumber(scrollRatioInput?.value ?? "", DEFAULT_SCROLL_SETTINGS.scrollRatio),
         waitSecondsPerRound: parsePositiveNumber(waitSecondsPerRoundInput?.value ?? "", DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound),
-        stableRoundsNeeded: Math.floor(parsePositiveNumber(stableRoundsNeededInput?.value ?? "", DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded)),
-        maxRounds: Math.floor(parsePositiveNumber(maxRoundsInput?.value ?? "", DEFAULT_SCROLL_SETTINGS.maxRounds)),
+        stableRoundsNeeded: Math.max(1, Math.floor(parsePositiveNumber(stableRoundsNeededInput?.value ?? "", DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded))),
+        maxRounds: Math.max(1, Math.floor(parsePositiveNumber(maxRoundsInput?.value ?? "", DEFAULT_SCROLL_SETTINGS.maxRounds))),
         maxElapsedSeconds: parsePositiveNumber(maxElapsedSecondsInput?.value ?? "", DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds),
-    };
+    });
 }
 async function persistScrollSettingsFromInputs() {
     const settings = readScrollSettingsFromInputs();
@@ -135,7 +127,7 @@ async function initializePopup() {
         checkAllSavedListInput.checked = true;
     }
 }
-saveCurrentTweetButton?.addEventListener("click", async () => {
+bindAction(saveCurrentTweetButton, async () => {
     const activeTab = await getActiveTab();
     if (!activeTab?.id) {
         setStatus("No active tab found.");
@@ -149,13 +141,13 @@ saveCurrentTweetButton?.addEventListener("click", async () => {
         saveAs: true,
         skipPreviouslySaved: checkCurrentSavedListInput?.checked ?? true,
     }));
-    if (!response.ok) {
-        setStatus(`Error: ${response.error ?? "Unknown error"}`);
+    if (!response?.ok) {
+        setStatus(`Error: ${response?.error ?? "Unknown error"}`);
         return;
     }
-    setStatus(formatStats("Current tweet scan complete", response.stats));
+    setStatus(formatStats("Current tweet save complete", response.stats));
 });
-saveAllVisibleButton?.addEventListener("click", async () => {
+bindAction(saveAllVisibleButton, async () => {
     const activeTab = await getActiveTab();
     if (!activeTab?.id) {
         setStatus("No active tab found.");
@@ -182,24 +174,42 @@ saveAllVisibleButton?.addEventListener("click", async () => {
             maxElapsedMs: Math.round(scrollSettings.maxElapsedSeconds * 1000),
         },
     }));
-    if (!response.ok) {
-        setStatus(`Error: ${response.error ?? "Unknown error"}`);
+    if (!response?.ok) {
+        setStatus(`Error: ${response?.error ?? "Unknown error"}`);
         return;
     }
-    setStatus(formatStats("All visible images scan complete", response.stats));
+    setStatus(formatStats("Batch save complete", response.stats));
 });
-clearSavedHistoryButton?.addEventListener("click", async () => {
+bindAction(clearSavedHistoryButton, async () => {
     const count = await getSavedMediaCount();
     const confirmed = window.confirm(`Clear saved history?\n\nCurrently stored items: ${count}\n\nThis will remove the saved media history used for duplicate skipping.`);
     if (!confirmed) {
         setStatus("Clear history cancelled.");
         return;
     }
-    await chrome.storage.local.remove([
-        STORAGE_KEY_SAVED_MEDIA_MAP,
-        LEGACY_STORAGE_KEY_SAVED_MEDIA,
-    ]);
-    setStatus(`Saved history cleared. Removed items: ${count}`);
+    const response = await chrome.runtime.sendMessage({ type: "CLEAR_SAVED_HISTORY" });
+    if (!response?.ok)
+        throw new Error(response?.error ?? "No response received.");
+    setStatus(`Saved history cleared. Removed items: ${response.removed}`);
 });
-void initializePopup();
+let popupBusy = false;
+function setBusy(busy) {
+    for (const button of [saveCurrentTweetButton, saveAllVisibleButton, clearSavedHistoryButton]) {
+        if (button)
+            button.disabled = busy;
+    }
+}
+function bindAction(button, action) {
+    button?.addEventListener("click", () => {
+        if (popupBusy)
+            return;
+        popupBusy = true;
+        setBusy(true);
+        void action().catch((error) => setStatus(`Error: ${String(error)}`))
+            .finally(() => { popupBusy = false; setBusy(false); });
+    });
+}
+setBusy(true);
+void initializePopup().catch((error) => setStatus(`Error loading settings: ${String(error)}`))
+    .finally(() => setBusy(false));
 export {};

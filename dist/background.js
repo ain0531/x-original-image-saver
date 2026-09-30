@@ -5,14 +5,22 @@ const SAVED_MEDIA_KEEP_MS = SAVED_MEDIA_KEEP_DAYS * 24 * 60 * 60 * 1000;
 function parseMediaUrl(rawUrl) {
     try {
         const url = new URL(rawUrl);
-        const pathMatch = url.pathname.match(/\/media\/([^/?]+)/);
+        if (url.protocol !== "https:" || url.hostname !== "pbs.twimg.com") {
+            return null;
+        }
+        const pathMatch = url.pathname.match(/^\/media\/([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9]+)(?::[A-Za-z0-9]+)?)?$/);
         const mediaId = pathMatch?.[1] ?? null;
         if (!mediaId) {
             console.warn("[parseMediaUrl] mediaId not found:", rawUrl);
             return null;
         }
-        const format = url.searchParams.get("format");
+        const format = (url.searchParams.get("format") ?? pathMatch?.[2] ?? "").toLowerCase();
+        if (!["jpg", "jpeg", "png", "webp", "gif"].includes(format)) {
+            return null;
+        }
         const quality = url.searchParams.get("name");
+        url.pathname = `/media/${mediaId}`;
+        url.searchParams.set("format", format);
         const orig = new URL(url.toString());
         orig.searchParams.set("name", "orig");
         const large = new URL(url.toString());
@@ -94,9 +102,6 @@ function pruneExpiredSavedMediaMap(map, now = Date.now()) {
     }
     return { prunedMap, removedCount };
 }
-function countSavedMediaMap(map) {
-    return Object.keys(map).length;
-}
 function buildDownloadCandidates(parsed) {
     if (!parsed.format) {
         console.warn("[buildDownloadCandidates] format missing:", parsed);
@@ -141,10 +146,69 @@ function resolveUniqueFileName(requestedFileName, usedFileNames) {
         sequence += 1;
     }
 }
+class DownloadInterruptedError extends Error {
+    constructor(reason) {
+        super(`Download interrupted: ${reason}`);
+        this.reason = reason;
+    }
+}
+// Subscribe before searching so completion between download() and search() is
+// observed. Periodic API calls also keep the worker active during long transfers.
+function waitForDownload(downloadId) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (error) => {
+            if (settled)
+                return;
+            settled = true;
+            clearInterval(pollTimer);
+            clearTimeout(timeoutTimer);
+            chrome.downloads.onChanged.removeListener(onChanged);
+            error ? reject(error) : resolve();
+        };
+        const onChanged = (delta) => {
+            if (delta.id !== downloadId)
+                return;
+            if (delta.state?.current === "complete")
+                finish();
+            if (delta.state?.current === "interrupted") {
+                finish(new DownloadInterruptedError(delta.error?.current ?? "UNKNOWN"));
+            }
+        };
+        const checkState = async () => {
+            try {
+                const [item] = await chrome.downloads.search({ id: downloadId });
+                if (item?.state === "complete")
+                    finish();
+                else if (item?.state === "interrupted") {
+                    finish(new DownloadInterruptedError(item.error ?? "UNKNOWN"));
+                }
+                else if (!item)
+                    finish(new Error("Download no longer exists."));
+            }
+            catch (error) {
+                // Monitoring failure does not prove the transfer stopped.
+                finish(new DownloadInterruptedError(`MONITOR_FAILED: ${String(error)}`));
+            }
+        };
+        const pollTimer = setInterval(() => { void checkState(); }, 15000);
+        const timeoutTimer = setTimeout(() => {
+            void chrome.downloads.cancel(downloadId)
+                .then(async () => {
+                const [item] = await chrome.downloads.search({ id: downloadId });
+                finish(item?.state === "complete" ? undefined : new Error("Download timed out."));
+            })
+                .catch((error) => finish(new DownloadInterruptedError(`CANCEL_FAILED: ${String(error)}`)));
+        }, 120000);
+        chrome.downloads.onChanged.addListener(onChanged);
+        void checkState();
+    });
+}
 async function tryDownloadSequentially(candidates, usedFileNames, saveAs) {
     console.log(`[tryDownloadSequentially] start: candidates=${candidates.length}, saveAs=${saveAs}`);
     for (const candidate of candidates) {
         const finalFileName = resolveUniqueFileName(candidate.fileName, usedFileNames);
+        let started = false;
         try {
             console.log(`Trying download: quality=${candidate.quality}, requested=${candidate.fileName}, final=${finalFileName}, saveAs=${saveAs}`, candidate.url);
             const downloadId = await chrome.downloads.download({
@@ -152,7 +216,9 @@ async function tryDownloadSequentially(candidates, usedFileNames, saveAs) {
                 filename: finalFileName,
                 saveAs,
             });
-            console.log(`[tryDownloadSequentially] accepted: quality=${candidate.quality}, finalFileName=${finalFileName}, downloadId=${downloadId}`);
+            started = true;
+            await waitForDownload(downloadId);
+            console.log(`[tryDownloadSequentially] completed: quality=${candidate.quality}, finalFileName=${finalFileName}, downloadId=${downloadId}`);
             return {
                 success: true,
                 used: candidate,
@@ -162,6 +228,16 @@ async function tryDownloadSequentially(candidates, usedFileNames, saveAs) {
         }
         catch (error) {
             console.warn(`Download failed with ${candidate.quality}:`, error);
+            // A rejected Save As request can mean cancellation; Chrome provides no
+            // stable error code here. Do not reopen the chooser in that case.
+            if (saveAs && !started)
+                return { success: false };
+            // User cancellation must not open another Save As dialog.
+            if (error instanceof DownloadInterruptedError &&
+                (error.reason.startsWith("USER_") || error.reason.startsWith("CANCEL_FAILED") ||
+                    error.reason.startsWith("MONITOR_FAILED"))) {
+                return { success: false };
+            }
         }
     }
     console.warn("[tryDownloadSequentially] all candidates failed");
@@ -188,102 +264,70 @@ async function getAllVisibleMediaUrlsFromPage(tabId) {
     return result;
 }
 async function autoScrollAndCollectVisibleMediaUrls(tabId, options) {
-    const scrollRatio = options?.scrollRatio ?? 0.8;
-    const waitMsPerRound = options?.waitMsPerRound ?? 700;
-    const stableRoundsNeeded = options?.stableRoundsNeeded ?? 3;
-    const maxRounds = options?.maxRounds ?? 20;
-    const maxElapsedMs = options?.maxElapsedMs ?? 30000;
-    console.log("[autoScrollAndCollectVisibleMediaUrls] options:", {
-        scrollRatio,
-        waitMsPerRound,
-        stableRoundsNeeded,
-        maxRounds,
-        maxElapsedMs,
-    });
+    const positive = (value, fallback, max) => typeof value === "number" && Number.isFinite(value) && value > 0
+        ? Math.min(value, max) : fallback;
+    const scrollRatio = positive(options?.scrollRatio, 0.8, 1);
+    const waitMs = positive(options?.waitMsPerRound, 700, 10000);
+    const stableNeeded = Math.max(1, Math.floor(positive(options?.stableRoundsNeeded, 3, 100)));
+    const maxRounds = Math.max(1, Math.floor(positive(options?.maxRounds, 20, 1000)));
+    const maxElapsedMs = positive(options?.maxElapsedMs, 30000, 300000);
     const startedAt = Date.now();
-    const collected = new Set();
-    let previousCount = -1;
+    const collected = new Map();
+    let pageUrl = "";
+    let rounds = 0;
     let stableRounds = 0;
+    const collect = async () => {
+        const result = await getAllVisibleMediaUrlsFromPage(tabId);
+        if (!result)
+            throw new Error("Could not read the page.");
+        if (pageUrl && result.pageUrl !== pageUrl)
+            throw new Error("The page changed during scanning.");
+        pageUrl = result.pageUrl;
+        if (!isTargetXPage(pageUrl))
+            throw new Error("Open an X/Twitter page.");
+        for (const url of result.matchedMediaUrls) {
+            const parsed = parseMediaUrl(url);
+            const key = parsed && buildMediaIdentityKey(parsed);
+            if (key)
+                collected.set(key, url);
+        }
+    };
+    const finish = (endedBy) => ({
+        pageUrl, totalUniqueMediaUrls: Array.from(collected.values()), rounds,
+        elapsedMs: Date.now() - startedAt, endedBy,
+    });
+    await collect();
     for (let round = 1; round <= maxRounds; round += 1) {
-        const elapsedMs = Date.now() - startedAt;
-        if (elapsedMs >= maxElapsedMs) {
-            console.log(`[autoscroll] stop: max-time at round=${round}`);
-            return {
-                pageUrl: "",
-                totalUniqueMediaUrls: Array.from(collected),
-                rounds: round - 1,
-                elapsedMs,
-                endedBy: "max-time",
-            };
-        }
-        const scanResult = await getAllVisibleMediaUrlsFromPage(tabId);
-        const pageUrl = scanResult?.pageUrl ?? "";
-        const currentUrls = scanResult?.matchedMediaUrls ?? [];
-        for (const url of currentUrls) {
-            collected.add(url);
-        }
-        const currentCount = collected.size;
-        const scrollInfoResult = await chrome.scripting.executeScript({
-            target: { tabId },
-            args: [scrollRatio],
+        if (Date.now() - startedAt >= maxElapsedMs)
+            return finish("max-time");
+        const previousCount = collected.size;
+        const [injection] = await chrome.scripting.executeScript({
+            target: { tabId }, args: [scrollRatio],
             func: (ratio) => {
                 const beforeY = window.scrollY;
-                const viewportHeight = window.innerHeight;
-                const scrollAmount = Math.floor(viewportHeight * ratio);
-                window.scrollBy(0, scrollAmount);
-                const afterY = window.scrollY;
-                const docHeight = document.documentElement.scrollHeight;
-                const nearBottom = afterY + viewportHeight >= docHeight - 50;
-                return {
-                    beforeY,
-                    afterY,
-                    viewportHeight,
-                    docHeight,
-                    nearBottom,
-                };
+                window.scrollBy(0, Math.max(1, Math.floor(window.innerHeight * ratio)));
+                return { beforeY, afterY: window.scrollY,
+                    nearBottom: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 50 };
             },
         });
-        const scrollInfo = scrollInfoResult[0]?.result;
-        console.log(`[autoscroll] round=${round}, currentCount=${currentCount}, previousCount=${previousCount}, stableRounds=${stableRounds}, nearBottom=${scrollInfo?.nearBottom}`);
-        if (currentCount === previousCount) {
-            stableRounds += 1;
-        }
-        else {
-            stableRounds = 0;
-        }
-        previousCount = currentCount;
-        if (scrollInfo?.nearBottom && stableRounds >= 2) {
-            console.log(`[autoscroll] stop: near-bottom-and-stable at round=${round}, count=${currentCount}`);
-            return {
-                pageUrl,
-                totalUniqueMediaUrls: Array.from(collected),
-                rounds: round,
-                elapsedMs: Date.now() - startedAt,
-                endedBy: "near-bottom-and-stable",
-            };
-        }
-        if (stableRounds >= stableRoundsNeeded) {
-            console.log(`[autoscroll] stop: stable at round=${round}, count=${currentCount}`);
-            return {
-                pageUrl,
-                totalUniqueMediaUrls: Array.from(collected),
-                rounds: round,
-                elapsedMs: Date.now() - startedAt,
-                endedBy: "stable",
-            };
-        }
-        if (round < maxRounds) {
-            await new Promise((resolve) => setTimeout(resolve, waitMsPerRound));
+        const scrollInfo = injection?.result;
+        if (!scrollInfo)
+            throw new Error("Could not scroll the page.");
+        rounds = round;
+        const remainingMs = Math.max(0, maxElapsedMs - (Date.now() - startedAt));
+        await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, remainingMs)));
+        // Every scroll, including the last, is followed by a scan.
+        await collect();
+        stableRounds = collected.size === previousCount ? stableRounds + 1 : 0;
+        if (Date.now() - startedAt >= maxElapsedMs)
+            return finish("max-time");
+        // Text-only posts are not the end of a timeline. Only stop for stability
+        // when scrolling has stopped making progress at the bottom.
+        if (scrollInfo.nearBottom && scrollInfo.beforeY === scrollInfo.afterY && stableRounds >= stableNeeded) {
+            return finish("near-bottom-and-stable");
         }
     }
-    console.log("[autoscroll] stop: max-rounds");
-    return {
-        pageUrl: "",
-        totalUniqueMediaUrls: Array.from(collected),
-        rounds: maxRounds,
-        elapsedMs: Date.now() - startedAt,
-        endedBy: "max-rounds",
-    };
+    return finish("max-rounds");
 }
 async function getCurrentTweetMediaUrlsFromPage(tabId) {
     const injectionResults = await chrome.scripting.executeScript({
@@ -312,14 +356,31 @@ async function getCurrentTweetMediaUrlsFromPage(tabId) {
                     selectedArticleIndex: null,
                 };
             }
-            articleCandidates.sort((a, b) => b.mediaCount - a.mediaCount);
-            const selected = articleCandidates[0];
+            const statusId = location.pathname.match(/\/status\/(\d+)/)?.[1];
+            // A timestamp permalink belongs to the article itself; quoted-post links
+            // and image links must not be used to identify the enclosing post.
+            const matchingIndex = statusId
+                ? articles.findIndex((article) => {
+                    const permalink = Array.from(article.querySelectorAll("a[href]"))
+                        .find((link) => link.querySelector("time"));
+                    return permalink !== undefined &&
+                        new URL(permalink.href, location.href)
+                            .pathname.match(/\/status\/(\d+)/)?.[1] === statusId;
+                })
+                : articles.findIndex((article) => {
+                    const rect = article.getBoundingClientRect();
+                    return rect.bottom > 0 && rect.top < window.innerHeight;
+                });
+            if (matchingIndex < 0) {
+                throw new Error("Could not identify the current post. Open its post detail page and try again.");
+            }
+            const selected = articleCandidates.find((candidate) => candidate.index === matchingIndex);
             return {
                 mode: "current-tweet",
                 pageUrl: location.href,
-                matchedMediaUrls: selected.mediaUrls,
+                matchedMediaUrls: selected?.mediaUrls ?? [],
                 articleCandidates,
-                selectedArticleIndex: selected.index,
+                selectedArticleIndex: matchingIndex,
             };
         },
     });
@@ -328,91 +389,35 @@ async function getCurrentTweetMediaUrlsFromPage(tabId) {
     return result;
 }
 async function saveParsedMediaList(parsedList, saveAs, options) {
-    const stats = {
-        total: parsedList.length,
-        skipped: 0,
-        success: 0,
-        failed: 0,
-    };
-    console.log("[saveParsedMediaList] start:", {
-        parsedListLength: parsedList.length,
-        saveAs,
-        skipPreviouslySaved: options?.skipPreviouslySaved ?? false,
-        parsedList,
-    });
-    if (parsedList.length === 0) {
-        console.log("No parsable media URLs found.");
+    const unique = new Map();
+    for (const item of parsedList)
+        unique.set(buildMediaIdentityKey(item) ?? item.originalUrl, item);
+    const stats = { total: unique.size, skipped: 0, success: 0, failed: 0 };
+    if (unique.size === 0)
         return stats;
-    }
-    console.log(`Found ${parsedList.length} media item(s).`);
+    const { prunedMap: savedMediaMap, removedCount } = pruneExpiredSavedMediaMap(await getSavedMediaMap());
+    if (removedCount > 0)
+        await saveSavedMediaMap(savedMediaMap);
     const usedFileNames = new Set();
-    const skipPreviouslySaved = options?.skipPreviouslySaved ?? false;
-    let savedMediaMap = {};
-    let savedMediaMapDirty = false;
-    if (skipPreviouslySaved) {
-        const loadedMap = await getSavedMediaMap();
-        const { prunedMap, removedCount } = pruneExpiredSavedMediaMap(loadedMap);
-        savedMediaMap = prunedMap;
-        if (removedCount > 0) {
-            savedMediaMapDirty = true;
-            console.log(`[savedMediaMap] removed expired records: ${removedCount}, remaining=${countSavedMediaMap(savedMediaMap)}`);
-        }
-        else {
-            console.log(`[savedMediaMap] loaded records: ${countSavedMediaMap(savedMediaMap)}`);
-        }
-    }
-    const filteredList = [];
-    for (const item of parsedList) {
-        if (!skipPreviouslySaved) {
-            filteredList.push(item);
-            continue;
-        }
-        const key = buildMediaIdentityKey(item);
-        if (!key) {
-            console.log("[saveParsedMediaList] no identity key, keep target:", item);
-            filteredList.push(item);
-            continue;
-        }
-        if (savedMediaMap[key] !== undefined) {
+    for (const target of unique.values()) {
+        const key = buildMediaIdentityKey(target);
+        if (options?.skipPreviouslySaved && key && savedMediaMap[key] !== undefined) {
             stats.skipped += 1;
-            console.log(`Skipping already saved media: ${key}`);
             continue;
         }
-        console.log(`[saveParsedMediaList] not found in saved map, keep: ${key}`);
-        filteredList.push(item);
-    }
-    console.log(`[saveParsedMediaList] total=${stats.total}, skipped=${stats.skipped}, toDownload=${filteredList.length}`);
-    console.log("[saveParsedMediaList] filteredList:", filteredList);
-    for (const [index, target] of filteredList.entries()) {
-        console.log(`Processing item ${index + 1}/${filteredList.length}:`, target);
-        if (!target.format) {
-            console.log("No format found in URL. Skipping for now.", target);
+        const result = await tryDownloadSequentially(buildDownloadCandidates(target), usedFileNames, saveAs);
+        if (!result.success) {
             stats.failed += 1;
             continue;
         }
-        const candidates = buildDownloadCandidates(target);
-        const downloadResult = await tryDownloadSequentially(candidates, usedFileNames, saveAs);
-        if (!downloadResult.success) {
-            console.error(`Both orig and large download attempts failed for mediaId=${target.mediaId}`);
-            stats.failed += 1;
-            continue;
-        }
-        if (skipPreviouslySaved) {
-            const key = buildMediaIdentityKey(target);
-            if (key) {
-                savedMediaMap[key] = Date.now();
-                savedMediaMapDirty = true;
-                console.log(`Saved media key recorded/updated: ${key}`);
-            }
+        // Record completed downloads even when duplicate checking is disabled.
+        // Persist per image so a later failure does not discard earlier successes.
+        if (key) {
+            savedMediaMap[key] = Date.now();
+            await saveSavedMediaMap(savedMediaMap);
         }
         stats.success += 1;
-        console.log(`Download started successfully for mediaId=${target.mediaId}, quality=${downloadResult.used.quality}, finalFileName=${downloadResult.finalFileName}, downloadId=${downloadResult.downloadId}`);
     }
-    if (skipPreviouslySaved && savedMediaMapDirty) {
-        await saveSavedMediaMap(savedMediaMap);
-        console.log(`[savedMediaMap] persisted records: ${countSavedMediaMap(savedMediaMap)}`);
-    }
-    console.log(`[saveParsedMediaList:done] total=${stats.total}, skipped=${stats.skipped}, success=${stats.success}, failed=${stats.failed}`);
     return stats;
 }
 function isTargetXPage(tabUrl) {
@@ -428,8 +433,7 @@ async function saveAllVisibleImages(tabId, tabUrl, saveAs, scrollSettings, skipP
         skipPreviouslySaved,
     });
     if (!isTargetXPage(tabUrl)) {
-        console.log("Not an X/Twitter page:", tabUrl);
-        return { total: 0, skipped: 0, success: 0, failed: 0 };
+        throw new Error("Open an X/Twitter page.");
     }
     const collectResult = await autoScrollAndCollectVisibleMediaUrls(tabId, scrollSettings);
     console.log("[saveAllVisibleImages] collectResult:", collectResult);
@@ -453,10 +457,12 @@ async function saveCurrentTweetImages(tabId, tabUrl, saveAs, skipPreviouslySaved
         skipPreviouslySaved,
     });
     if (!isTargetXPage(tabUrl)) {
-        console.log("Not an X/Twitter page:", tabUrl);
-        return { total: 0, skipped: 0, success: 0, failed: 0 };
+        throw new Error("Open an X/Twitter page.");
     }
     const result = await getCurrentTweetMediaUrlsFromPage(tabId);
+    if (result && result.pageUrl !== tabUrl) {
+        throw new Error("The page changed during scanning. Try again.");
+    }
     console.log("[saveCurrentTweetImages] raw result:", result);
     if (!result || result.matchedMediaUrls.length === 0) {
         console.log("No media URLs found for current tweet candidate.");
@@ -470,32 +476,42 @@ async function saveCurrentTweetImages(tabId, tabUrl, saveAs, skipPreviouslySaved
         skipPreviouslySaved,
     });
 }
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    console.log("[onMessage] received:", message);
-    if (message?.type === "SAVE_ALL_VISIBLE_IMAGES") {
-        void saveAllVisibleImages(message.tabId, message.tabUrl, message.saveAs ?? false, message.scrollSettings, message.skipPreviouslySaved ?? true)
-            .then((stats) => {
-            console.log("[onMessage] SAVE_ALL_VISIBLE_IMAGES stats:", stats);
-            sendResponse({ ok: true, stats });
-        })
-            .catch((error) => {
-            console.error("SAVE_ALL_VISIBLE_IMAGES failed:", error);
-            sendResponse({ ok: false, error: String(error) });
-        });
-        return true;
+// Serialize saves and history deletion across all popup windows. Reject a second
+// operation instead of queuing a stale tab/page request.
+let operationRunning = false;
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    const types = ["SAVE_ALL_VISIBLE_IMAGES", "SAVE_CURRENT_TWEET_IMAGES", "CLEAR_SAVED_HISTORY"];
+    if (!types.includes(message?.type))
+        return false;
+    if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL("popup.html")) {
+        sendResponse({ ok: false, error: "Untrusted request." });
+        return false;
     }
-    if (message?.type === "SAVE_CURRENT_TWEET_IMAGES") {
-        void saveCurrentTweetImages(message.tabId, message.tabUrl, message.saveAs ?? true, message.skipPreviouslySaved ?? true)
-            .then((stats) => {
-            console.log("[onMessage] SAVE_CURRENT_TWEET_IMAGES stats:", stats);
-            sendResponse({ ok: true, stats });
-        })
-            .catch((error) => {
-            console.error("SAVE_CURRENT_TWEET_IMAGES failed:", error);
-            sendResponse({ ok: false, error: String(error) });
-        });
-        return true;
+    if (operationRunning) {
+        sendResponse({ ok: false, error: "Another operation is running. Wait for it to finish." });
+        return false;
     }
-    return false;
+    operationRunning = true;
+    const run = async () => {
+        if (message.type === "CLEAR_SAVED_HISTORY") {
+            const map = await getSavedMediaMap();
+            const removed = Object.keys(map).length;
+            await chrome.storage.local.remove([STORAGE_KEY_SAVED_MEDIA_MAP, LEGACY_STORAGE_KEY_SAVED_MEDIA]);
+            return { ok: true, removed };
+        }
+        if (!Number.isInteger(message.tabId) || message.tabId < 0)
+            throw new Error("Invalid tab.");
+        const tab = await chrome.tabs.get(message.tabId);
+        const tabUrl = tab.url ?? "";
+        if (!isTargetXPage(tabUrl))
+            throw new Error("Open an X/Twitter page.");
+        const skip = message.skipPreviouslySaved !== false;
+        const stats = message.type === "SAVE_ALL_VISIBLE_IMAGES"
+            ? await saveAllVisibleImages(message.tabId, tabUrl, false, message.scrollSettings, skip)
+            : await saveCurrentTweetImages(message.tabId, tabUrl, true, skip);
+        return { ok: true, stats };
+    };
+    void run().then((response) => { operationRunning = false; sendResponse(response); }, (error) => { operationRunning = false; sendResponse({ ok: false, error: String(error) }); });
+    return true;
 });
 export {};

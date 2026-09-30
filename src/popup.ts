@@ -100,28 +100,15 @@ function normalizeScrollSettings(value: unknown): AllVisibleScrollSettings {
   }
 
   const candidate = value as Partial<AllVisibleScrollSettings>;
-
+  const positive = (value: unknown, fallback: number, max: number): number =>
+    typeof value === "number" && Number.isFinite(value) && value > 0
+      ? Math.min(value, max) : fallback;
   return {
-    scrollRatio:
-      typeof candidate.scrollRatio === "number"
-        ? candidate.scrollRatio
-        : DEFAULT_SCROLL_SETTINGS.scrollRatio,
-    waitSecondsPerRound:
-      typeof candidate.waitSecondsPerRound === "number"
-        ? candidate.waitSecondsPerRound
-        : DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound,
-    stableRoundsNeeded:
-      typeof candidate.stableRoundsNeeded === "number"
-        ? candidate.stableRoundsNeeded
-        : DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded,
-    maxRounds:
-      typeof candidate.maxRounds === "number"
-        ? candidate.maxRounds
-        : DEFAULT_SCROLL_SETTINGS.maxRounds,
-    maxElapsedSeconds:
-      typeof candidate.maxElapsedSeconds === "number"
-        ? candidate.maxElapsedSeconds
-        : DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds,
+    scrollRatio: positive(candidate.scrollRatio, DEFAULT_SCROLL_SETTINGS.scrollRatio, 1),
+    waitSecondsPerRound: positive(candidate.waitSecondsPerRound, DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound, 10),
+    stableRoundsNeeded: Math.max(1, Math.floor(positive(candidate.stableRoundsNeeded, DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded, 100))),
+    maxRounds: Math.max(1, Math.floor(positive(candidate.maxRounds, DEFAULT_SCROLL_SETTINGS.maxRounds, 1000))),
+    maxElapsedSeconds: positive(candidate.maxElapsedSeconds, DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds, 300),
   };
 }
 
@@ -168,7 +155,7 @@ function parsePositiveNumber(value: string, fallback: number): number {
 }
 
 function readScrollSettingsFromInputs(): AllVisibleScrollSettings {
-  return {
+  return normalizeScrollSettings({
     scrollRatio: parsePositiveNumber(
       scrollRatioInput?.value ?? "",
       DEFAULT_SCROLL_SETTINGS.scrollRatio
@@ -177,23 +164,23 @@ function readScrollSettingsFromInputs(): AllVisibleScrollSettings {
       waitSecondsPerRoundInput?.value ?? "",
       DEFAULT_SCROLL_SETTINGS.waitSecondsPerRound
     ),
-    stableRoundsNeeded: Math.floor(
+    stableRoundsNeeded: Math.max(1, Math.floor(
       parsePositiveNumber(
         stableRoundsNeededInput?.value ?? "",
         DEFAULT_SCROLL_SETTINGS.stableRoundsNeeded
       )
-    ),
-    maxRounds: Math.floor(
+    )),
+    maxRounds: Math.max(1, Math.floor(
       parsePositiveNumber(
         maxRoundsInput?.value ?? "",
         DEFAULT_SCROLL_SETTINGS.maxRounds
       )
-    ),
+    )),
     maxElapsedSeconds: parsePositiveNumber(
       maxElapsedSecondsInput?.value ?? "",
       DEFAULT_SCROLL_SETTINGS.maxElapsedSeconds
     ),
-  };
+  });
 }
 
 async function persistScrollSettingsFromInputs(): Promise<AllVisibleScrollSettings> {
@@ -245,7 +232,7 @@ async function initializePopup(): Promise<void> {
   }
 }
 
-saveCurrentTweetButton?.addEventListener("click", async () => {
+bindAction(saveCurrentTweetButton, async () => {
   const activeTab = await getActiveTab();
 
   if (!activeTab?.id) {
@@ -263,15 +250,15 @@ saveCurrentTweetButton?.addEventListener("click", async () => {
     skipPreviouslySaved: checkCurrentSavedListInput?.checked ?? true,
   })) as SaveResponse;
 
-  if (!response.ok) {
-    setStatus(`Error: ${response.error ?? "Unknown error"}`);
+  if (!response?.ok) {
+    setStatus(`Error: ${response?.error ?? "Unknown error"}`);
     return;
   }
 
-  setStatus(formatStats("Current tweet scan complete", response.stats));
+  setStatus(formatStats("Current tweet save complete", response.stats));
 });
 
-saveAllVisibleButton?.addEventListener("click", async () => {
+bindAction(saveAllVisibleButton, async () => {
   const activeTab = await getActiveTab();
 
   if (!activeTab?.id) {
@@ -307,15 +294,15 @@ saveAllVisibleButton?.addEventListener("click", async () => {
     },
   })) as SaveResponse;
 
-  if (!response.ok) {
-    setStatus(`Error: ${response.error ?? "Unknown error"}`);
+  if (!response?.ok) {
+    setStatus(`Error: ${response?.error ?? "Unknown error"}`);
     return;
   }
 
-  setStatus(formatStats("All visible images scan complete", response.stats));
+  setStatus(formatStats("Batch save complete", response.stats));
 });
 
-clearSavedHistoryButton?.addEventListener("click", async () => {
+bindAction(clearSavedHistoryButton, async () => {
   const count = await getSavedMediaCount();
 
   const confirmed = window.confirm(
@@ -327,13 +314,28 @@ clearSavedHistoryButton?.addEventListener("click", async () => {
     return;
   }
 
-  await chrome.storage.local.remove([
-    STORAGE_KEY_SAVED_MEDIA_MAP,
-    LEGACY_STORAGE_KEY_SAVED_MEDIA,
-  ]);
-  setStatus(`Saved history cleared. Removed items: ${count}`);
+  const response = await chrome.runtime.sendMessage({ type: "CLEAR_SAVED_HISTORY" });
+  if (!response?.ok) throw new Error(response?.error ?? "No response received.");
+  setStatus(`Saved history cleared. Removed items: ${response.removed}`);
 });
 
-void initializePopup();
+let popupBusy = false;
+function setBusy(busy: boolean): void {
+  for (const button of [saveCurrentTweetButton, saveAllVisibleButton, clearSavedHistoryButton]) {
+    if (button) button.disabled = busy;
+  }
+}
+function bindAction(button: HTMLButtonElement | null, action: () => Promise<void>): void {
+  button?.addEventListener("click", () => {
+    if (popupBusy) return;
+    popupBusy = true;
+    setBusy(true);
+    void action().catch((error) => setStatus(`Error: ${String(error)}`))
+      .finally(() => { popupBusy = false; setBusy(false); });
+  });
+}
+setBusy(true);
+void initializePopup().catch((error) => setStatus(`Error loading settings: ${String(error)}`))
+  .finally(() => setBusy(false));
 
 export {};
