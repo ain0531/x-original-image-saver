@@ -29,8 +29,13 @@
     "js": ["dist/bookmark-reader.js"],
     "run_at": "document_start",
     "world": "MAIN"
+  }, {
+    "matches": ["https://x.com/*", "https://twitter.com/*"],
+    "js": ["dist/post-buttons.js"],
+    "run_at": "document_idle"
   }],
   "side_panel": {
     "default_path": "sidepanel.html"
-  }
+  },
+  "options_ui": { "page": "options.html", "open_in_tab": true }
 }

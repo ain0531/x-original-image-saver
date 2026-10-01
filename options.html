@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>オプション — X 原寸画像保存</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 680px; margin: 32px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 24px; } h2 { font-size: 18px; margin-top: 0; }
+    section { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    label { display: block; font-weight: 600; margin-top: 16px; }
+    input { display: block; box-sizing: border-box; width: 100%; padding: 8px; margin-top: 4px; font: inherit; }
+    p { margin: 8px 0; } .help { color: #555; font-size: 13px; }
+    button { padding: 10px 16px; font: inherit; cursor: pointer; }
+    #status { white-space: pre-wrap; } #preview { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>オプション</h1>
+  <p>設定は、次に開始する保存処理から反映されます。実行中・再開中の処理は開始時の設定を使います。</p>
+  <form id="options-form">
+    <section aria-labelledby="limits-title">
+      <h2 id="limits-title">取得上限の設定</h2>
+      <label for="max-pages">最大取得ページ数</label>
+      <input id="max-pages" type="number" min="1" max="1000" step="1" required disabled>
+      <p class="help">ページ数は投稿数とは異なります。上限で止まった場合は、続きから再開できます。</p>
+      <label for="max-seconds">取得時間の上限（秒）</label>
+      <input id="max-seconds" type="number" min="1" max="300" step="1" required disabled>
+      <p class="help">取得済み画像の保存は、取得が止まった後も継続します。</p>
+    </section>
+    <section aria-labelledby="files-title">
+      <h2 id="files-title">保存ファイルの設定</h2>
+      <label for="save-folder">保存先サブフォルダ</label>
+      <input id="save-folder" type="text" maxlength="200" placeholder="例：X画像/ブックマーク" disabled>
+      <p class="help">Chromeのダウンロード先の中に保存します。空欄ならダウンロード先に直接保存します。C:\などの絶対パスは指定できません。</p>
+      <button id="open-download-settings" type="button">Chromeのダウンロード設定を開く</button>
+      <label for="file-name">ファイル名の形式</label>
+      <input id="file-name" type="text" maxlength="150" required disabled>
+      <p class="help">{mediaId}は画像ID、{format}は拡張子に置き換わります。例：{mediaId}_orig.{format}。同名ファイルは上書きしません。</p>
+      <p id="preview" class="help"></p>
+      <p class="help">「現在の投稿の画像を保存」では、ここで指定した名前・フォルダを候補として保存先ダイアログを開きます。Chromeの保存先確認設定によっては、一括保存でも確認が表示されます。</p>
+    </section>
+    <button id="save-options" type="submit" disabled>設定を保存</button>
+  </form>
+  <p id="status" role="status" aria-live="polite">設定を読み込んでいます...</p>
+  <script type="module" src="dist/options.js"></script>
+</body>
+</html>

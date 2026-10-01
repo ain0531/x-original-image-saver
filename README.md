@@ -17,6 +17,22 @@ makes its own bookmark requests.
 
 ## Saving without scrolling
 
+While the extension is enabled, posts in the main X timeline receive a
+**特別保存** button in each post's bottom action row. Clicking it adds a like and
+a bookmark through X's own controls, preserving either if already active. It
+does not download images. The button shows **特別保存済み** only after both states
+are confirmed; failures appear beside it and can be retried. Clicking again does
+not remove likes or bookmarks. Newly loaded posts receive buttons too. Reload X after
+installing, updating or enabling the extension to install the content script.
+
+Open **オプション** in the side panel to configure acquisition limits, a subfolder
+under Chrome's Downloads directory, and a filename pattern. Defaults remain 20
+pages, 30 seconds, no subfolder, and `{mediaId}_orig.{format}`. Saved settings
+apply to new jobs; resumed jobs retain their initial settings. Existing limit
+settings are read during migration. The options page also opens Chrome's download
+settings to change the base folder. Absolute paths are not accepted by the
+extension. Saving to a different folder does not reset duplicate history.
+
 **画像をまとめて保存** never scrolls the page or resets its scroll position.
 The panel explicitly reports which of these two routes ran:
 

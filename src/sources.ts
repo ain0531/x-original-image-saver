@@ -1,8 +1,9 @@
 import { parseMediaUrl } from './media.js';
 import { BookmarkPage, parseBookmarkPage } from './bookmarks.js';
 export type Snapshot = { pageUrl: string; scope: string; documentId: number; urls: string[]; posts: string[]; issues: string[]; loading: boolean; bottom: boolean; y: number; verifiedPostIds?: string[] };
-export async function snapshot(tabId: number, current = false): Promise<Snapshot> {
-  const [injection] = await chrome.scripting.executeScript({ target: { tabId }, args: [current], func: (current: boolean) => {
+export async function snapshot(tabId: number, current = false, targetPostId?: string): Promise<Snapshot> {
+  const args: [boolean, string?] = targetPostId ? [current, targetPostId] : [current];
+  const [injection] = await chrome.scripting.executeScript({ target: { tabId }, args, func: (current: boolean, targetPostId?: string) => {
     const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
     if (!root) throw new Error('投稿一覧を確認できません。Xのページを開いてください。');
     const selected = root.querySelector('[role="tab"][aria-selected="true"]');
@@ -10,11 +11,11 @@ export async function snapshot(tabId: number, current = false): Promise<Snapshot
     const scope = JSON.stringify([location.href, selected?.textContent ?? '', account]);
     let articles = Array.from(root.querySelectorAll('article'));
     const postId = (article: Element) => {
-      const link = Array.from(article.querySelectorAll('a[href]')).find(link => link.querySelector('time'));
+      const link = Array.from(article.querySelectorAll('a[href]')).find(link => link.querySelector('time') && link.closest('article') === article);
       return link ? new URL((link as HTMLAnchorElement).href, location.href).pathname.match(/\/status\/(\d+)/)?.[1] ?? '' : '';
     };
     if (current) {
-      const id = location.pathname.match(/\/status\/(\d+)/)?.[1];
+      const id = targetPostId ?? location.pathname.match(/\/status\/(\d+)/)?.[1];
       const selected = id ? articles.find(article => postId(article) === id) : articles.find(article => {
         const rect = article.getBoundingClientRect(); return rect.bottom > 0 && rect.top < window.innerHeight;
       });

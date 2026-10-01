@@ -1,6 +1,7 @@
 import { errorText, isOriginalDownload, isXPage } from './media.js';
 import { ImageHistory } from './history.js';
 import { snapshot, network, domPage } from './sources.js';
+import { DEFAULT_OPTIONS, getOptions, downloadFileName } from './preferences.js';
 const JOB_KEY = 'imageSaveJob';
 const TASK_PREFIX = 'imageSaveTask:';
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -78,7 +79,7 @@ export class SaveJobs {
             const tab = await chrome.tabs.get(this.job.tabId);
             if (tab.url !== this.job.url)
                 throw new Error('保存を開始したXのページを開いてください。');
-            const snap = await snapshot(this.job.tabId, this.job.source === 'current');
+            const snap = await snapshot(this.job.tabId, this.job.source === 'current', this.job.postId);
             if (snap.scope !== this.job.scope)
                 throw new Error('ページ・選択タブ・アカウントが変わりました。元の対象に戻してください。');
             for (const task of this.tasks.values())
@@ -109,6 +110,7 @@ export class SaveJobs {
         if (!isXPage(tab.url ?? ''))
             throw new Error('Xのページを開いてください。');
         const current = message.type === 'SAVE_CURRENT_TWEET_IMAGES';
+        const preferences = await getOptions();
         const snap = await snapshot(message.tabId, current);
         if (snap.pageUrl !== tab.url)
             throw new Error('ページが変わりました。もう一度開始してください。');
@@ -120,7 +122,7 @@ export class SaveJobs {
         const stored = await chrome.storage.local.get(null);
         const oldKeys = Object.keys(stored).filter(key => key.startsWith(TASK_PREFIX));
         const job = { id: String(Date.now()) + '-' + Math.random().toString(36).slice(2), tabId: message.tabId, url: snap.pageUrl, scope: snap.scope, documentId: snap.documentId,
-            source: current ? 'current' : probe?.available && probe.scope === snap.scope ? 'network' : 'loaded', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: message.skipPreviouslySaved !== false, settings: settings(message.scrollSettings), stable: 0 };
+            source: current ? 'current' : probe?.available && probe.scope === snap.scope ? 'network' : 'loaded', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: message.skipPreviouslySaved !== false, settings: settings(message.scrollSettings ?? { maxRounds: preferences.maxPages, maxElapsedMs: preferences.maxSeconds * 1000 }), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: current };
         // Save the new job and carried queue before removing the old queue.
         const carried = { [JOB_KEY]: job };
         for (const task of pending)
@@ -243,7 +245,7 @@ export class SaveJobs {
                     const started = Date.now();
                     let missing = job.issues.filter(issue => issue.includes('読み込まれていない画像') || issue.includes('非表示の画像'));
                     while (job.status === 'running') {
-                        const snap = await snapshot(job.tabId, job.source === 'current');
+                        const snap = await snapshot(job.tabId, job.source === 'current', job.postId);
                         if (snap.scope !== job.scope || snap.documentId !== job.documentId)
                             throw new Error('画像の読み込み中にページ・アカウントが変わりました。');
                         await this.enqueue(domPage(snap));
@@ -291,7 +293,7 @@ export class SaveJobs {
             task.startedAt = Date.now();
             await this.taskWrite(task);
             try {
-                task.downloadId = await chrome.downloads.download({ url: task.media.origUrl, filename: `${task.media.mediaId}_orig.${task.media.format}`, conflictAction: 'uniquify', saveAs: this.job.source === 'current' });
+                task.downloadId = await chrome.downloads.download({ url: task.media.origUrl, filename: downloadFileName(task.media, { folder: this.job.folder ?? '', fileName: this.job.fileName ?? DEFAULT_OPTIONS.fileName }), conflictAction: 'uniquify', saveAs: this.job.saveAs ?? this.job.source === 'current' });
             }
             catch (error) {
                 task.state = 'failed';

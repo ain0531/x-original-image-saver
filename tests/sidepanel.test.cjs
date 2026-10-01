@@ -34,7 +34,7 @@ function harness({ get, sendMessage } = {}) {
   const chrome = {
     tabs: { query: async () => [{ id: 1, url: 'https://x.com/home' }] },
     storage: { local: { get: get ?? (async () => ({})), set: async () => {} } },
-    runtime: { sendMessage: async message => {
+    runtime: { openOptionsPage: async () => {}, sendMessage: async message => {
       if (message.type === 'GET_SAVE_STATUS') return { ok: true };
       messages.push(message);
       return sendMessage ? sendMessage(message) : { ok: true, removed: 1 };
@@ -85,16 +85,10 @@ test('initialization failures are visible and leave controls usable', async () =
   assert.equal(h.elements.get('save-current-tweet').disabled, false);
 });
 
-test('scroll settings clamp invalid and excessive values', async () => {
-  const h = harness(); await flush();
-  h.elements.get('stable-rounds-needed').value = '0.5';
-  h.elements.get('max-rounds').value = '99999';
-  h.elements.get('scroll-ratio').value = '5';
-  const settings = h.context.readScrollSettingsFromInputs();
-  assert.equal(settings.stableRoundsNeeded, 1);
-  assert.equal(settings.maxRounds, 1000);
-  assert.equal(settings.scrollRatio, 1);
-  const invalid = h.context.normalizeScrollSettings({ maxRounds: Infinity, maxElapsedSeconds: -1 });
-  assert.equal(invalid.maxRounds, 20);
-  assert.equal(invalid.maxElapsedSeconds, 30);
+test('side panel opens the registered options page', async () => {
+  const h = harness(); await flush(); let opened = false;
+  h.chrome.runtime.openOptionsPage = async () => { opened = true; };
+  h.elements.get('open-options').click(); await flush(); assert.equal(opened, true);
+  const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+  assert.equal(manifest.options_ui.page, 'options.html'); assert.equal(manifest.options_ui.open_in_tab, true);
 });

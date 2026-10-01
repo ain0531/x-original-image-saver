@@ -44,10 +44,33 @@
 | 一時停止 | 新たな取得・転送の開始を止める。進行中の要求や転送は完了する場合がある |
 | 未処理分・続きから再開 | 同じ対象ページで、保存待ち・失敗画像と、直接取得の続きを処理する |
 | 保存履歴を消去 | 確認ダイアログ後、保存済み画像の履歴を消去する。画像ファイルそのものや未処理ジョブは削除しない |
+| オプション | 別タブで取得上限・保存先サブフォルダ・ファイル名を設定する |
+| 投稿内の「特別保存」 | 投稿最下部の操作列に表示し、押した投稿に「いいね」と「ブックマーク」を付ける。画像の保存は行わない |
 
 一括保存の開始確認ポップアップは表示しない。一括保存は `saveAs: false`。現在の投稿の保存は `saveAs: true` で、保存先選択が発生する。
 
 保存処理中は別の保存開始・履歴消去を受け付けない。複数のパネルからの要求も同じバックグラウンド処理で制御する。
+
+「特別保存」ボタンは、拡張機能が有効なXのメイン投稿欄で、投稿自身のタイムスタンプから投稿IDを確認できる各記事に追加する。後から読み込まれた投稿にも追加し、同じ記事への重複追加を避ける。拡張機能の無効化を検知した際は、追加したボタンと監視を解除する。更新・有効化後はXのページを再読み込みして適用する。
+
+特別保存はX自身の操作ボタンを使って、いいね・ブックマークを順に付ける。既に付いている状態は維持し、再クリックでも解除しない。両方の画面上の反映を確認した場合に「特別保存済み」と表示する。片方の失敗や操作ボタンを確認できない場合は横に理由を表示し、再試行では未設定の操作だけを行う。画像のダウンロード要求は送信しない。X側の操作列や識別子の変更により操作できない場合がある。
+
+### 3.1 オプションページ
+
+サイドパネルの「オプション」またはChromeの拡張機能のオプションから開く。取得上限の入力欄はサイドパネルから移動している。
+
+| 設定 | 初期値・内容 |
+| --- | --- |
+| 最大取得ページ数 | 20ページ。1～1,000の整数 |
+| 取得時間の上限 | 30秒。1～300秒 |
+| 保存先サブフォルダ | 空欄。Chromeのダウンロード先を基準とする相対パス。例：`X画像/ブックマーク` |
+| ファイル名の形式 | `{mediaId}_orig.{format}`。画像IDと拡張子を置き換えて保存する |
+
+「設定を保存」で永続化し、次に開始する保存処理で読み込む。進行中・再開中のジョブでは開始時の設定を保持する。従来の取得上限の設定は引き継ぐ。
+
+保存先を空欄にするとChromeのダウンロード先に直接保存する。絶対パス、上位フォルダへの移動、使用不能なフォルダ・ファイル名は受け付けない。「Chromeのダウンロード設定を開く」で基準となるダウンロード先を変更できる。
+
+ファイル名には`{mediaId}`が必要で、末尾を`.{format}`にする。フォルダ区切りや未対応の変数は使えない。保存例を表示する。保存先・ファイル名を変更しても、保存履歴の重複判定は継続する。
 
 ## 4. 取得経路
 
@@ -141,7 +164,7 @@ https://pbs.twimg.com/media/<メディアID>?format=<形式>&name=orig
 
 - 一括保存は最大4件、現在の投稿は1件を同時転送する。
 - 投稿データの取得完了を待たず、発見・永続化した画像の転送を開始する。
-- ファイル名は `<メディアID>_orig.<形式>`。
+- ファイル名の初期値は `<メディアID>_orig.<形式>`。オプションで形式と保存先サブフォルダを指定できる。
 - 同名ファイルがある場合はChromeの `uniquify` で別名にする。既存ファイルは上書きしない。
 - 原寸の転送に失敗しても縮小画像には切り替えない。失敗画像は再開対象として残す。
 - 一括保存の画面確認は不要。並列転送なのでファイルの保存完了順は投稿順と一致するとは限らない。
@@ -210,7 +233,7 @@ https://pbs.twimg.com/media/<メディアID>?format=<形式>&name=orig
 7. 実行中の処理は1ジョブ。複数アカウント・複数対象を並行して保存する機能はない。
 8. 原寸の内容検証や同じ内容の別メディアIDの重複排除はない。
 9. 現在、再開時に停止理由を空にするため、取得がすでに終わっているジョブの再開後に停止理由が表示されなくなる場合がある。末尾到達済みジョブの失敗画像だけを再処理しても「停止・要確認」のままになる場合がある。
-10. モックAPI・DOM・通信のテストは直近32件通過。実際のユーザーのX環境での接続成功、速度、全投稿・全画像の網羅性は未検証。
+10. モックAPI・DOM・通信・オプション・投稿内ボタンのテストは直近41件通過。特別保存のいいね・ブックマーク操作、既存状態の維持、失敗時の再試行を含む。実際のユーザーのX環境での接続成功、速度、全投稿・全画像の網羅性は未検証。
 
 ## 12. 関連ソース
 
@@ -218,9 +241,11 @@ https://pbs.twimg.com/media/<メディアID>?format=<形式>&name=orig
 | --- | --- |
 | [manifest.json](C:/Users/user/source/repos/x-original-image-saver/manifest.json) | 拡張機能の権限、対象ホスト、サイドパネル、ページ開始時の監視 |
 | [sidepanel.html](C:/Users/user/source/repos/x-original-image-saver/sidepanel.html) / [sidepanel.ts](C:/Users/user/source/repos/x-original-image-saver/src/sidepanel.ts) | 操作、設定、経路と結果の表示 |
+| [options.html](C:/Users/user/source/repos/x-original-image-saver/options.html) / [options.ts](C:/Users/user/source/repos/x-original-image-saver/src/options.ts) / [preferences.ts](C:/Users/user/source/repos/x-original-image-saver/src/preferences.ts) | 取得上限と保存ファイルの設定、入力検証、永続化、ファイル名生成 |
 | [bookmark-reader.ts](C:/Users/user/source/repos/x-original-image-saver/src/bookmark-reader.ts) | ページ内の通信監視、投稿画像一覧の一時キャッシュ、カーソルを使う要求 |
 | [bookmarks.ts](C:/Users/user/source/repos/x-original-image-saver/src/bookmarks.ts) | 応答から投稿、画像、カーソル、未確認事項を抽出 |
 | [sources.ts](C:/Users/user/source/repos/x-original-image-saver/src/sources.ts) | 対象記事の選択、DOM画像と投稿データの補完 |
 | [jobs.ts](C:/Users/user/source/repos/x-original-image-saver/src/jobs.ts) | 取得上限、転送、永続化、一時停止・再開 |
 | [media.ts](C:/Users/user/source/repos/x-original-image-saver/src/media.ts) / [history.ts](C:/Users/user/source/repos/x-original-image-saver/src/history.ts) | 原寸URL、保存完了判定、180日の履歴と重複確認 |
 | [background.ts](C:/Users/user/source/repos/x-original-image-saver/src/background.ts) | パネルからの要求受付、復旧用アラーム |
+| [post-buttons.ts](C:/Users/user/source/repos/x-original-image-saver/src/post-buttons.ts) | 投稿の操作列への特別保存ボタン追加、いいね・ブックマーク操作、状態確認、有効状態の確認 |

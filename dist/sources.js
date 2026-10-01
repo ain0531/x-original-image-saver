@@ -1,7 +1,8 @@
 import { parseMediaUrl } from './media.js';
 import { parseBookmarkPage } from './bookmarks.js';
-export async function snapshot(tabId, current = false) {
-    const [injection] = await chrome.scripting.executeScript({ target: { tabId }, args: [current], func: (current) => {
+export async function snapshot(tabId, current = false, targetPostId) {
+    const args = targetPostId ? [current, targetPostId] : [current];
+    const [injection] = await chrome.scripting.executeScript({ target: { tabId }, args, func: (current, targetPostId) => {
             const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
             if (!root)
                 throw new Error('投稿一覧を確認できません。Xのページを開いてください。');
@@ -10,11 +11,11 @@ export async function snapshot(tabId, current = false) {
             const scope = JSON.stringify([location.href, selected?.textContent ?? '', account]);
             let articles = Array.from(root.querySelectorAll('article'));
             const postId = (article) => {
-                const link = Array.from(article.querySelectorAll('a[href]')).find(link => link.querySelector('time'));
+                const link = Array.from(article.querySelectorAll('a[href]')).find(link => link.querySelector('time') && link.closest('article') === article);
                 return link ? new URL(link.href, location.href).pathname.match(/\/status\/(\d+)/)?.[1] ?? '' : '';
             };
             if (current) {
-                const id = location.pathname.match(/\/status\/(\d+)/)?.[1];
+                const id = targetPostId ?? location.pathname.match(/\/status\/(\d+)/)?.[1];
                 const selected = id ? articles.find(article => postId(article) === id) : articles.find(article => {
                     const rect = article.getBoundingClientRect();
                     return rect.bottom > 0 && rect.top < window.innerHeight;

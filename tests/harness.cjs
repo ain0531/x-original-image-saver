@@ -35,11 +35,11 @@ function harness(initial = {}) {
     },
   };
   const context = vm.createContext({ chrome, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
-  for (const name of ['media', 'history', 'bookmarks', 'sources', 'jobs', 'background']) {
+  for (const name of ['media', 'preferences', 'history', 'bookmarks', 'sources', 'jobs', 'background']) {
     const source = fs.readFileSync('dist/' + name + '.js', 'utf8').replace(/^import .*;\s*$/mg, '').replace(/\bexport (?=(?:async|class|function|const))/g, '').replace(/export\s*\{\s*\};?/g, '');
     vm.runInContext(source, context, { filename: name });
   }
-  const request = message => new Promise(resolve => listener(message, { id: 'test', url: 'chrome-extension://test/sidepanel.html' }, resolve));
+  const request = (message, sender = { id: 'test', url: 'chrome-extension://test/sidepanel.html' }) => new Promise(resolve => listener(message, sender, resolve));
   return { context, chrome, calls, states, injections, snap, pages, cached, scope, request, get store() { return store; }, set available(value) { networkAvailable = value; }, async done() {
     for (let n = 0; n < 200; n++) { await flush(); const status = await request({ type: 'GET_SAVE_STATUS' }); if (status.job?.status !== 'running' && !status.busy) return status; await new Promise(r => setTimeout(r, 5)); }
     throw new Error('Job did not finish');
