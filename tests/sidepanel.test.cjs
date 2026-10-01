@@ -4,6 +4,23 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
+test('an open side panel resolves the current window active tab for every save', async () => {
+  const h = harness({ sendMessage: async () => ({
+    ok: true, stats: { total: 0, success: 0, skipped: 0, failed: 0 },
+  }) });
+  await flush();
+  let id = 11;
+  h.chrome.tabs.query = async options => {
+    assert.equal(options.active, true);
+    assert.equal(options.currentWindow, true);
+    return [{ id, url: 'https://x.com/home' }];
+  };
+  h.elements.get('save-current-tweet').click(); await flush();
+  id = 12;
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.deepEqual(h.messages.map(message => message.tabId), [11, 12]);
+});
+
 function harness({ get, sendMessage } = {}) {
   const elements = new Map();
   const messages = [];
@@ -18,16 +35,17 @@ function harness({ get, sendMessage } = {}) {
     tabs: { query: async () => [{ id: 1, url: 'https://x.com/home' }] },
     storage: { local: { get: get ?? (async () => ({})), set: async () => {} } },
     runtime: { sendMessage: async message => {
+      if (message.type === 'GET_SAVE_STATUS') return { ok: true };
       messages.push(message);
       return sendMessage ? sendMessage(message) : { ok: true, removed: 1 };
     } },
   };
-  const context = vm.createContext({ document, chrome, window: { confirm: () => true } });
-  vm.runInContext(fs.readFileSync('dist/popup.js', 'utf8').replace(/export\s*\{\s*\};?/g, ''), context);
+  const context = vm.createContext({ document, chrome, window: { confirm: () => true }, setInterval: () => 1 });
+  vm.runInContext(fs.readFileSync('dist/sidepanel.js', 'utf8').replace(/export\s*\{\s*\};?/g, ''), context);
   return { elements, context, chrome, messages };
 }
 
-test('popup displays messaging failures and re-enables buttons', async () => {
+test('side panel displays messaging failures and re-enables buttons', async () => {
   const h = harness({ sendMessage: async () => { throw new Error('connection lost'); } });
   await flush();
   h.elements.get('save-current-tweet').click();
@@ -37,7 +55,7 @@ test('popup displays messaging failures and re-enables buttons', async () => {
   assert.equal(h.elements.get('save-current-tweet').disabled, false);
 });
 
-test('popup suppresses repeated clicks until the request finishes', async () => {
+test('side panel suppresses repeated clicks until the request finishes', async () => {
   let resolve;
   const pending = new Promise(r => { resolve = r; });
   const h = harness({ sendMessage: () => pending });
@@ -49,7 +67,7 @@ test('popup suppresses repeated clicks until the request finishes', async () => 
   resolve({ ok: true, stats: { total: 1, success: 1, skipped: 0, failed: 0 } });
   await flush();
   assert.equal(button.disabled, false);
-  assert.match(h.elements.get('status').textContent, /Downloaded: 1/);
+  assert.match(h.elements.get('status').textContent, /保存完了: 1/);
 });
 
 test('history deletion goes through the worker', async () => {
@@ -57,7 +75,7 @@ test('history deletion goes through the worker', async () => {
   h.elements.get('clear-saved-history').click();
   await flush();
   assert.equal(h.messages[0].type, 'CLEAR_SAVED_HISTORY');
-  assert.match(h.elements.get('status').textContent, /Removed items: 1/);
+  assert.match(h.elements.get('status').textContent, /消去件数: 1/);
 });
 
 test('initialization failures are visible and leave controls usable', async () => {

@@ -1,13 +1,20 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <title>X Original Image Saver</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>X 原寸画像保存</title>
     <style>
       body {
         font-family: Arial, sans-serif;
         margin: 12px;
-        min-width: 280px;
+        overflow-wrap: anywhere;
+      }
+
+      input[type="number"] {
+        box-sizing: border-box;
+        width: 100%;
+        min-width: 0;
       }
 
       h1 {
@@ -111,36 +118,39 @@
     </style>
   </head>
   <body>
-    <h1>X Original Image Saver</h1>
+    <h1>X 原寸画像保存</h1>
+    <p style="font-size:12px">スクロールせずに保存します。ブックマークの投稿データを取得できない場合は、読み込み済み画像のみが対象です。</p>
 
     <div class="button-group">
       <div class="action-row">
-        <button id="save-current-tweet">Save current tweet images</button>
+        <button id="save-current-tweet">現在の投稿の画像を保存</button>
         <label class="action-option">
           <input id="check-current-saved-list" type="checkbox" checked />
-          Check saved history before download
+          保存履歴を確認して重複を避ける
         </label>
       </div>
 
       <div class="action-row">
-        <button id="save-all-visible">Save all visible images</button>
+        <button id="save-all-visible">画像をまとめて保存</button>
         <label class="action-option">
           <input id="check-all-saved-list" type="checkbox" checked />
-          Check saved history before download
+          保存履歴を確認して重複を避ける
         </label>
       </div>
 
       <div class="action-row">
-        <button id="clear-saved-history">Clear saved history</button>
+        <button id="clear-saved-history">保存履歴を消去</button>
       </div>
+      <button id="pause-save" disabled>一時停止</button>
+      <button id="resume-save" disabled>未処理分・続きから再開</button>
     </div>
 
     <details class="settings-section">
-      <summary>Batch scan settings</summary>
+      <summary>取得上限の設定</summary>
 
       <div class="settings-content">
-        <div class="setting-item">
-          <label for="scroll-ratio">Scroll ratio</label>
+        <div class="setting-item" hidden>
+          <label for="scroll-ratio">スクロールの割合</label>
           <input
             id="scroll-ratio"
             type="number"
@@ -150,13 +160,13 @@
             value="0.8"
           />
           <div class="setting-description">
-            How far to scroll each round relative to the current screen height.
-            Example: 0.8 means 80% of one screen per scroll.
+            1回のスクロール量を画面の高さに対する割合で指定します。
+            例：0.8は画面の高さの80%です。現在の保存処理ではスクロールしません。
           </div>
         </div>
 
-        <div class="setting-item">
-          <label for="wait-seconds-per-round">Wait time per round (seconds)</label>
+        <div class="setting-item" hidden>
+          <label for="wait-seconds-per-round">読み込みの待機時間（秒）</label>
           <input
             id="wait-seconds-per-round"
             type="number"
@@ -166,13 +176,12 @@
             value="0.7"
           />
           <div class="setting-description">
-            How long to wait after each scroll before checking for newly loaded
-            images.
+            読み込み途中の画像を再確認するときの待機時間の設定です。
           </div>
         </div>
 
-        <div class="setting-item">
-          <label for="stable-rounds-needed">Stable rounds needed</label>
+        <div class="setting-item" hidden>
+          <label for="stable-rounds-needed">変化がないことを確認する回数</label>
           <input
             id="stable-rounds-needed"
             type="number"
@@ -182,13 +191,13 @@
             value="3"
           />
           <div class="setting-description">
-            Stop at the bottom when scrolling makes no progress and the number of
-            detected images does not increase for this many rounds.
+            末尾で画像数が増えないことを確認する回数です。
+            現在のスクロールしない保存処理では使用しません。
           </div>
         </div>
 
         <div class="setting-item">
-          <label for="max-rounds">Maximum scroll rounds</label>
+          <label for="max-rounds">最大取得ページ数</label>
           <input
             id="max-rounds"
             type="number"
@@ -198,13 +207,12 @@
             value="20"
           />
           <div class="setting-description">
-            The scan will stop after this many scroll attempts even if more images
-            may remain.
+            上限で止まった場合は、続きの取得位置を保持します。全件の保存完了とは判定しません。
           </div>
         </div>
 
         <div class="setting-item">
-          <label for="max-elapsed-seconds">Maximum total time (seconds)</label>
+          <label for="max-elapsed-seconds">取得時間の上限（秒）</label>
           <input
             id="max-elapsed-seconds"
             type="number"
@@ -214,15 +222,14 @@
             value="30"
           />
           <div class="setting-description">
-            Overall time limit for batch scanning. The scan stops when this limit
-            is reached.
+            取得済み画像の保存は継続します。「画像をまとめて保存」は先頭から取得します。過去数年分の全走査は自動で開始しません。
           </div>
         </div>
       </div>
     </details>
 
-    <div id="status">Ready.</div>
+    <div id="status" role="status" aria-live="polite">待機中</div>
 
-    <script type="module" src="dist/popup.js"></script>
+    <script type="module" src="dist/sidepanel.js"></script>
   </body>
 </html>

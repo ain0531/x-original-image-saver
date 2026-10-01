@@ -1,13 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "X Original Image Saver",
+  "minimum_chrome_version": "116",
+  "name": "X 原寸画像保存",
   "version": "0.1.0",
-  "description": "Save original-quality images from X.",
+  "description": "Xの投稿画像を原寸で保存します。",
   "permissions": [
     "activeTab",
     "scripting",
     "downloads",
-    "storage"
+    "storage",
+    "sidePanel",
+    "alarms"
   ],
   "host_permissions": [
     "https://x.com/*",
@@ -19,7 +22,15 @@
     "type": "module"
   },
   "action": {
-    "default_title": "X Original Image Saver",
-    "default_popup": "popup.html"
+    "default_title": "X 原寸画像保存を開く"
+  },
+  "content_scripts": [{
+    "matches": ["https://x.com/*", "https://twitter.com/*"],
+    "js": ["dist/bookmark-reader.js"],
+    "run_at": "document_start",
+    "world": "MAIN"
+  }],
+  "side_panel": {
+    "default_path": "sidepanel.html"
   }
 }
