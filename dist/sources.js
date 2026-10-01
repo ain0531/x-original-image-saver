@@ -1,5 +1,18 @@
-import { parseMediaUrl } from './media.js';
+import { parseMediaUrl, isXPage } from './media.js';
 import { parseBookmarkPage } from './bookmarks.js';
+export function assertBookmarkScope(pageUrl, scope) {
+    let valid = false;
+    try {
+        const [url, selected] = JSON.parse(scope);
+        const path = new URL(pageUrl).pathname;
+        valid = isXPage(pageUrl) && url === pageUrl &&
+            (/^\/i\/bookmarks(?:\/[^/]+)*\/?$/.test(path) ||
+                /^\/i\/history\/?$/.test(path) && /^(ブックマーク|Bookmarks)[▼▾⌄]?$/i.test(String(selected).replace(/\s/g, '')));
+    }
+    catch { /* Unknown page state cannot authorize a bookmark save. */ }
+    if (!valid)
+        throw new Error('ブックマークのページを開いてから画像をまとめて保存してください。履歴ページでは「ブックマーク」を選択してください。');
+}
 export async function snapshot(tabId, current = false, targetPostId) {
     const args = targetPostId ? [current, targetPostId] : [current];
     const [injection] = await chrome.scripting.executeScript({ target: { tabId }, args, func: (current, targetPostId) => {
@@ -24,6 +37,9 @@ export async function snapshot(tabId, current = false, targetPostId) {
                     throw new Error('現在の投稿を特定できません。投稿の詳細ページを開いてください。');
                 articles = [selected];
             }
+            const unconfirmed = current ? [] : articles.filter(article => !Array.from(article.querySelectorAll('[data-testid="removeBookmark"]')).some(button => button.closest('article') === article));
+            if (!current)
+                articles = articles.filter(article => !unconfirmed.includes(article));
             const urls = new Set();
             const issues = [];
             for (const article of articles) {
@@ -40,13 +56,15 @@ export async function snapshot(tabId, current = false, targetPostId) {
                 if (article.querySelector('[data-testid="sensitiveMediaInterstitial"]'))
                     issues.push(`投稿 ${postId(article) || '不明'}: 非表示の画像があります。`);
             }
-            return { pageUrl: location.href, scope, documentId: performance.timeOrigin, urls: [...urls], posts: articles.map(postId), issues,
+            return { pageUrl: location.href, scope, documentId: performance.timeOrigin, urls: [...urls], posts: articles.map(postId), issues, excludedPosts: unconfirmed.length,
                 loading: !!root.querySelector('[role="progressbar"]'), y: window.scrollY,
                 bottom: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 50 };
         } });
     if (!injection?.result)
         throw new Error('ページを取得できません。');
     const result = injection.result;
+    if (!current)
+        assertBookmarkScope(result.pageUrl, result.scope);
     const ids = result.posts.filter(id => /^\d+$/.test(id));
     if (ids.length) {
         const [metadata] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', args: [ids, result.scope], func: async (ids, scope) => {
@@ -100,6 +118,8 @@ export async function network(tabId, operation, cursor, expectedScope) {
 }
 export function domPage(value) {
     const issues = [...value.issues];
+    if (value.excludedPosts)
+        issues.push(`ブックマーク済みと確認できない投稿 ${value.excludedPosts}件は保存対象から除外しました。`);
     const media = value.urls.flatMap(url => {
         const parsed = parseMediaUrl(url);
         if (!parsed)

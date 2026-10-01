@@ -116,7 +116,7 @@ bindAction(saveAllVisibleButton, async () => {
   }
 
 
-  setStatus("スクロールせずに取得・保存を開始しています...");
+  setStatus("タブを開かずにブックマークのデータ取得を準備しています...");
 
   const response = (await chrome.runtime.sendMessage({
     type: "SAVE_ALL_VISIBLE_IMAGES",
@@ -162,7 +162,7 @@ function renderProgress(response: any): void {
   jobActive = job?.status === 'running';
   workerBusy = response.busy === true;
   watchProgress = jobActive || response.busy === true;
-  const source = job?.source === 'network' ? 'ブックマークの投稿データを直接取得（スクロールなし）' : job?.source === 'loaded' ? '読み込み済み画像のみ（スクロールなし）' : '現在の投稿';
+  const source = job?.source === 'direct' ? 'ブックマークのデータを取得（タブなし）' : job?.source === 'network' ? 'ブックマークの投稿データを直接取得（スクロールなし）' : job?.source === 'loaded' ? '読み込み済み画像のみ（スクロールなし）' : '現在の投稿';
   const reasons: Record<string, string> = {
     'timeline-end': '投稿データの末尾まで取得', 'max-rounds': '取得ページ数の上限。続きは未取得',
     'max-time': '取得時間の上限。続きは未取得', 'loaded-only': '読み込み済みの範囲のみ。全件の取得は未確認',

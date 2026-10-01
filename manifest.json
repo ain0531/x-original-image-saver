@@ -10,12 +10,15 @@
     "downloads",
     "storage",
     "sidePanel",
-    "alarms"
+    "alarms",
+    "cookies",
+    "webRequest"
   ],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
-    "https://pbs.twimg.com/*"
+    "https://pbs.twimg.com/*",
+    "https://abs.twimg.com/responsive-web/*"
   ],
   "background": {
     "service_worker": "dist/background.js",

@@ -1,6 +1,17 @@
-import { parseMediaUrl } from './media.js';
+import { parseMediaUrl, isXPage } from './media.js';
 import { BookmarkPage, parseBookmarkPage } from './bookmarks.js';
-export type Snapshot = { pageUrl: string; scope: string; documentId: number; urls: string[]; posts: string[]; issues: string[]; loading: boolean; bottom: boolean; y: number; verifiedPostIds?: string[] };
+export type Snapshot = { pageUrl: string; scope: string; documentId: number; urls: string[]; posts: string[]; issues: string[]; loading: boolean; bottom: boolean; y: number; verifiedPostIds?: string[]; excludedPosts?: number };
+export function assertBookmarkScope(pageUrl: string, scope: string): void {
+  let valid = false;
+  try {
+    const [url, selected] = JSON.parse(scope);
+    const path = new URL(pageUrl).pathname;
+    valid = isXPage(pageUrl) && url === pageUrl &&
+      (/^\/i\/bookmarks(?:\/[^/]+)*\/?$/.test(path) ||
+        /^\/i\/history\/?$/.test(path) && /^(ブックマーク|Bookmarks)[▼▾⌄]?$/i.test(String(selected).replace(/\s/g, '')));
+  } catch { /* Unknown page state cannot authorize a bookmark save. */ }
+  if (!valid) throw new Error('ブックマークのページを開いてから画像をまとめて保存してください。履歴ページでは「ブックマーク」を選択してください。');
+}
 export async function snapshot(tabId: number, current = false, targetPostId?: string): Promise<Snapshot> {
   const args: [boolean, string?] = targetPostId ? [current, targetPostId] : [current];
   const [injection] = await chrome.scripting.executeScript({ target: { tabId }, args, func: (current: boolean, targetPostId?: string) => {
@@ -22,6 +33,8 @@ export async function snapshot(tabId: number, current = false, targetPostId?: st
       if (!selected) throw new Error('現在の投稿を特定できません。投稿の詳細ページを開いてください。');
       articles = [selected];
     }
+    const unconfirmed = current ? [] : articles.filter(article => !Array.from(article.querySelectorAll('[data-testid="removeBookmark"]')).some(button => button.closest('article') === article));
+    if (!current) articles = articles.filter(article => !unconfirmed.includes(article));
     const urls = new Set<string>();
     const issues: string[] = [];
     for (const article of articles) {
@@ -36,12 +49,13 @@ export async function snapshot(tabId: number, current = false, targetPostId?: st
       }
       if (article.querySelector('[data-testid="sensitiveMediaInterstitial"]')) issues.push(`投稿 ${postId(article) || '不明'}: 非表示の画像があります。`);
     }
-    return { pageUrl: location.href, scope, documentId: performance.timeOrigin, urls: [...urls], posts: articles.map(postId), issues,
+    return { pageUrl: location.href, scope, documentId: performance.timeOrigin, urls: [...urls], posts: articles.map(postId), issues, excludedPosts: unconfirmed.length,
       loading: !!root.querySelector('[role="progressbar"]'), y: window.scrollY,
       bottom: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 50 };
   } });
   if (!injection?.result) throw new Error('ページを取得できません。');
   const result: Snapshot = injection.result;
+  if (!current) assertBookmarkScope(result.pageUrl, result.scope);
   const ids = result.posts.filter(id => /^\d+$/.test(id));
   if (ids.length) {
     const [metadata] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', args: [ids, result.scope], func: async (ids: string[], scope: string) => {
@@ -81,6 +95,7 @@ export async function network(tabId: number, operation: 'probe' | 'page', cursor
 }
 export function domPage(value: Snapshot): BookmarkPage {
   const issues = [...value.issues];
+  if (value.excludedPosts) issues.push(`ブックマーク済みと確認できない投稿 ${value.excludedPosts}件は保存対象から除外しました。`);
   const media = value.urls.flatMap(url => {
     const parsed = parseMediaUrl(url);
     if (!parsed) issues.push(`未対応の画像URL: ${url}`);

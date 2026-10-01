@@ -1,7 +1,8 @@
-import { KEEP_MS, Media, isOriginalDownload } from "./media.js";
+import { Media, isOriginalDownload, parseMediaUrl } from "./media.js";
 export type SavedImage = { savedAt: number; quality: "orig" | "unknown"; downloadId?: number; url?: string };
 const HISTORY_PREFIX = "savedImage:";
 const MIGRATED = "imageHistoryMigratedV2";
+const INDEXED = 'imageHistoryDownloadIndexV1';
 export class ImageHistory {
   private ready: Promise<void> | undefined;
   private async migrate(): Promise<void> {
@@ -29,7 +30,26 @@ export class ImageHistory {
     await chrome.storage.local.remove(["savedMediaMap", "savedMediaKeys"]);
   }
   private async ensure(): Promise<void> {
-    if (!this.ready) this.ready = this.migrate().catch(error => { this.ready = undefined; throw error; });
+    if (!this.ready) this.ready = (async () => {
+      await this.migrate();
+      const stored = await chrome.storage.local.get(null) as Record<string, any>;
+      if (stored[INDEXED]) return;
+      // Import verifiable past original downloads once, even if Chrome's file
+      // has since moved. The durable image ID records are authoritative after that.
+      let items: chrome.downloads.DownloadItem[];
+      try { items = await chrome.downloads.search({ urlRegex: '^https://pbs\\.twimg\\.com/media/', state: 'complete', limit: 0 }); }
+      catch { return; } // Known ID records remain usable if Chrome history is unavailable.
+      const rows: Record<string, SavedImage | boolean> = {};
+      for (const item of items) {
+        const media = parseMediaUrl(item.url);
+        if (!media || !isOriginalDownload({ ...item, exists: true }, media.mediaId)) continue;
+        const key = HISTORY_PREFIX + media.mediaId;
+        if (stored[key]?.quality === 'orig') continue;
+        const date = Date.parse(item.startTime);
+        rows[key] = { savedAt: Number.isFinite(date) && date > 0 ? date : Date.now(), quality: 'orig', downloadId: item.id, url: item.url };
+      }
+      await chrome.storage.local.set({ ...rows, [INDEXED]: true });
+    })().catch(error => { this.ready = undefined; throw error; });
     await this.ready;
   }
   async confirmedMany(media: Media[]): Promise<Map<string, number | null>> {
@@ -42,22 +62,19 @@ export class ImageHistory {
       const key = HISTORY_PREFIX + m.mediaId;
       const record = stored[key] as SavedImage | undefined;
       try {
-        if (record && Number.isFinite(record.savedAt) && record.savedAt > 0 && record.savedAt <= Date.now() && Date.now() - record.savedAt <= KEEP_MS) {
-          if (record.quality === "orig" && Number.isInteger(record.downloadId)) {
-            const [item] = await chrome.downloads.search({ id: record.downloadId });
-            if (isOriginalDownload(item, m.mediaId)) confirmed = item.id;
+        if (record && Number.isFinite(record.savedAt) && record.savedAt > 0 && record.savedAt <= Date.now()) {
+          if (record.quality === "orig") {
+            confirmed = record.downloadId ?? 0;
           } else if (record.quality === "unknown") {
             // Old records can contain large fallbacks. Verify an original;
             // an unknown or unreadable record is never a reason to skip.
-            const items = await chrome.downloads.search({ urlRegex: `/media/${m.mediaId}(?:[?.:])`, limit: 100 });
-            const item = items.find(item => isOriginalDownload(item, m.mediaId));
+            const items = await chrome.downloads.search({ urlRegex: `/media/${m.mediaId}(?:[?.:])`, limit: 0 });
+            const item = items.find(item => isOriginalDownload({ ...item, exists: true }, m.mediaId));
             if (item) {
               confirmed = item.id;
               await chrome.storage.local.set({ [key]: { ...record, quality: "orig", downloadId: item.id, url: item.url } });
             }
           }
-        } else if (record && Number.isFinite(record.savedAt) && Date.now() - record.savedAt > KEEP_MS) {
-          await chrome.storage.local.remove(key);
         }
       } catch { confirmed = null; }
       result.set(m.mediaId, confirmed);

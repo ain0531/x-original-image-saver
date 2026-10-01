@@ -1,10 +1,11 @@
 import { Media, errorText, isOriginalDownload, isXPage } from './media.js';
 import { ImageHistory } from './history.js';
-import { snapshot, network, domPage } from './sources.js';
+import { snapshot, network, domPage, assertBookmarkScope } from './sources.js';
+import { directBookmarks } from './direct-bookmarks.js';
 import { DEFAULT_OPTIONS, getOptions, downloadFileName } from './preferences.js';
 export type Settings = { scrollRatio: number; waitMsPerRound: number; stableRoundsNeeded: number; maxRounds: number; maxElapsedMs: number };
 export type Task = { media: Media; state: 'pending' | 'starting' | 'downloading' | 'saved' | 'skipped' | 'failed'; downloadId?: number; startedAt?: number; error?: string };
-export type Job = { id: string; tabId: number; url: string; scope: string; documentId: number; source: 'network' | 'loaded' | 'current'; status: 'running' | 'paused' | 'done' | 'review'; cursor?: string; rounds: number; sourceDone: boolean; endedBy: string; issues: string[]; skip: boolean; settings: Settings; domCheckpoint?: string; stable: number; folder?: string; fileName?: string; postId?: string; saveAs?: boolean };
+export type Job = { id: string; tabId: number; url: string; scope: string; documentId: number; source: 'direct' | 'network' | 'loaded' | 'current'; status: 'running' | 'paused' | 'done' | 'review'; cursor?: string; rounds: number; sourceDone: boolean; endedBy: string; issues: string[]; skip: boolean; settings: Settings; domCheckpoint?: string; stable: number; folder?: string; fileName?: string; postId?: string; saveAs?: boolean; background?: boolean; cookieStoreId?: string };
 const JOB_KEY = 'imageSaveJob';
 const TASK_PREFIX = 'imageSaveTask:';
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -63,12 +64,17 @@ export class SaveJobs {
     if (message.type === 'RESUME_SAVE') {
       if (!this.job) throw new Error('再開できる処理がありません。');
       if (this.job.status === 'running' || this.running) throw new Error('処理中です。停止処理が完了してから再開してください。');
-      const tab = await chrome.tabs.get(this.job.tabId);
-      if (tab.url !== this.job.url) throw new Error('保存を開始したXのページを開いてください。');
-      const snap = await snapshot(this.job.tabId, this.job.source === 'current', this.job.postId);
-      if (snap.scope !== this.job.scope) throw new Error('ページ・選択タブ・アカウントが変わりました。元の対象に戻してください。');
+      this.job.skip = true;
+      if (this.job.source === 'direct') await directBookmarks.check(this.job.cookieStoreId!, this.job.scope);
+      else {
+        const tab = await chrome.tabs.get(this.job.tabId);
+        if (tab.url !== this.job.url) throw new Error('保存を開始したXのページを開いてください。');
+        const snap = await snapshot(this.job.tabId, this.job.source === 'current', this.job.postId);
+        if (this.job.source !== 'current') assertBookmarkScope(snap.pageUrl, snap.scope);
+        if (snap.scope !== this.job.scope) throw new Error('ページ・選択タブ・アカウントが変わりました。元の対象に戻してください。');
+      }
       for (const task of this.tasks.values()) if (task.state === 'failed') { task.state = task.downloadId ? 'downloading' : 'pending'; task.error = undefined; await this.taskWrite(task); }
-      if (this.job.endedBy !== 'timeline-end' && this.job.source === 'network') this.job.sourceDone = false;
+      if (this.job.endedBy !== 'timeline-end' && ['network', 'direct'].includes(this.job.source)) this.job.sourceDone = false;
       this.job.rounds = 0; this.job.status = 'running'; this.job.endedBy = ''; await this.persist();
       this.kick(); return this.status();
     }
@@ -79,26 +85,30 @@ export class SaveJobs {
     if (this.running || this.job?.status === 'running') throw new Error('保存処理中です。一時停止してから開始してください。');
     if (!Number.isInteger(message.tabId) || message.tabId < 0) throw new Error('無効なタブです。');
     const tab = await chrome.tabs.get(message.tabId);
-    if (!isXPage(tab.url ?? '')) throw new Error('Xのページを開いてください。');
     const current = message.type === 'SAVE_CURRENT_TWEET_IMAGES';
+    if (current && !isXPage(tab.url ?? '')) throw new Error('Xのページを開いてください。');
     const preferences = await getOptions();
-    const snap = await snapshot(message.tabId, current);
-    if (snap.pageUrl !== tab.url) throw new Error('ページが変わりました。もう一度開始してください。');
-    const probe = current ? undefined : await network(message.tabId, 'probe');
+    const target = current ? undefined : await directBookmarks.prepare(message.tabId);
+    const tabId = message.tabId;
+    const snap = target ? { pageUrl: 'https://x.com/i/bookmarks', scope: target.scope, documentId: 0, urls: [], posts: [], issues: [], loading: false, bottom: false, y: 0 } : await snapshot(tabId, true);
+    if (!current) assertBookmarkScope(snap.pageUrl, snap.scope);
+    if (current && snap.pageUrl !== tab.url) throw new Error('ページが変わりました。もう一度開始してください。');
     // Never drop unfinished work when starting from a new head/current position.
     const pending = [...this.tasks.values()].filter(task => !['saved', 'skipped'].includes(task.state));
+    if (!current && this.job?.source === 'current' && pending.length) throw new Error('個別保存の未処理画像があります。先にその保存処理を再開して完了してください。');
     if (this.job && this.job.scope !== snap.scope && pending.length) throw new Error('別の対象に未処理画像があります。元のページで再開して保存を終えてください。');
     const stored = await chrome.storage.local.get(null);
     const oldKeys = Object.keys(stored).filter(key => key.startsWith(TASK_PREFIX));
-    const job: Job = { id: String(Date.now()) + '-' + Math.random().toString(36).slice(2), tabId: message.tabId, url: snap.pageUrl, scope: snap.scope, documentId: snap.documentId,
-      source: current ? 'current' : probe?.available && probe.scope === snap.scope ? 'network' : 'loaded', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: message.skipPreviouslySaved !== false, settings: settings(message.scrollSettings ?? { maxRounds: preferences.maxPages, maxElapsedMs: preferences.maxSeconds * 1000 }), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: current };
+    const job: Job = { id: String(Date.now()) + '-' + Math.random().toString(36).slice(2), tabId, url: snap.pageUrl, scope: snap.scope, documentId: snap.documentId, background: !current, cookieStoreId: target?.storeId,
+      source: current ? 'current' : 'direct', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: true, settings: settings(message.scrollSettings ?? { maxRounds: preferences.maxPages, maxElapsedMs: preferences.maxSeconds * 1000 }), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: current };
     // Save the new job and carried queue before removing the old queue.
     const carried: Record<string, unknown> = { [JOB_KEY]: job };
     for (const task of pending) carried[TASK_PREFIX + job.id + ':' + task.media.mediaId] = { ...task, state: task.state === 'failed' ? (task.downloadId ? 'downloading' : 'pending') : task.state, error: undefined };
     await chrome.storage.local.set(carried);
     this.job = job; this.tasks = new Map(pending.map(task => [task.media.mediaId, carried[TASK_PREFIX + job.id + ':' + task.media.mediaId] as Task]));
     if (oldKeys.length) await chrome.storage.local.remove(oldKeys);
-    await this.enqueue(domPage(snap));
+    // Native bookmark responses are authoritative; do not mix visible recommendations in.
+    if (current) await this.enqueue(domPage(snap));
     if (current) { job.sourceDone = !snap.loading && !snap.issues.length; job.endedBy = 'current-post'; await this.persist(); }
     else if (job.source === 'loaded') { job.sourceDone = !snap.loading && !snap.issues.length; job.endedBy = 'loaded-only'; job.issues.push('ブックマークの通信を確認できないため、読み込み済みの画像のみが対象です。拡張機能を再読み込みし、Xのブックマーク画面も再読み込みして再試行してください。自動スクロールは行いません。'); await this.persist(); }
     this.kick(); return this.status();
@@ -127,6 +137,8 @@ export class SaveJobs {
     await this.init();
     const job = this.job;
     if (!job || job.status !== 'running') return;
+    if (job.source !== 'current') assertBookmarkScope(job.url, job.scope);
+    if (job.source === 'direct') await directBookmarks.check(job.cookieStoreId!, job.scope);
     // Downloads are processed while the next page is collected, at most four.
     let collecting = true;
     const workers = Array.from({ length: job.source === 'current' ? 1 : 4 }, () => (async () => {
@@ -148,10 +160,12 @@ export class SaveJobs {
         }
         // Bound the durable queue as well as the transfer concurrency.
         if ([...this.tasks.values()].filter(t => ['pending', 'starting', 'downloading'].includes(t.state)).length > 48) { await delay(100); continue; }
-        if (job.source === 'network') {
-          const result = await network(job.tabId, 'page', job.cursor, job.scope);
-          if (!result.available || !result.page) throw new Error('ブックマークの通信を確認できません。対象ページを再読み込みして再開してください。');
-          const page = result.page;
+        if (job.source === 'network' || job.source === 'direct') {
+          const page = job.source === 'direct' ? await directBookmarks.page(job.cookieStoreId!, job.scope, job.cursor) : await (async () => {
+            const result = await network(job.tabId, 'page', job.cursor, job.scope);
+            if (!result.available || !result.page) throw new Error('ブックマークの通信を確認できません。対象ページを再読み込みして再開してください。');
+            return result.page;
+          })();
           await this.enqueue(page); // Durable image queue first, cursor second.
           if (page.cursor && page.cursor === job.cursor) throw new Error('同じ取得位置が返されました。末尾とは判定せず停止しました。');
           job.cursor = page.cursor; job.rounds++;
@@ -185,6 +199,10 @@ export class SaveJobs {
     await this.persist();
   }
   private async transfer(task: Task): Promise<void> {
+    if (!task.downloadId && ['pending', 'starting'].includes(task.state) && this.job!.skip) {
+      const confirmed = await this.history.confirmedMany([task.media]);
+      if (confirmed.get(task.media.mediaId) != null) { task.state = 'skipped'; await this.taskWrite(task); return; }
+    }
     if (task.state === 'starting' && !task.downloadId) {
       // Recover the small download()/persist gap only when exactly one match is proven.
       const matches = await chrome.downloads.search({ url: task.media.origUrl, startedAfter: new Date(task.startedAt!).toISOString() });
