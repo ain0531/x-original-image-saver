@@ -9,14 +9,15 @@ function readerHarness() {
   class XHR {
     open() {} setRequestHeader() {} send() {} addEventListener(type, callback) { if (type === 'load') this.load = callback; }
   }
-  const root = { querySelector: () => selected ? { textContent: selected } : null };
+  const articles = [];
+  const root = { querySelector: () => selected ? { textContent: selected } : null, querySelectorAll: () => articles };
   const document = { querySelector: selector => selector.includes('AccountSwitcher') ? (account ? { textContent: account } : null) : root };
   const window = { fetch: async (input, init) => {
     requests.push({ url: String(input), init }); return { ok: true, status: 200, json: async () => responseBody, clone: () => ({ json: async () => responseBody }) };
   } };
   const context = vm.createContext({ window, document, location: { href: 'https://x.com/i/history', origin: 'https://x.com' }, performance: { timeOrigin: 7 }, XMLHttpRequest: XHR, URL, Headers, Request, AbortController, setTimeout, clearTimeout, console });
   vm.runInContext(fs.readFileSync('dist/bookmark-reader.js', 'utf8'), context);
-  return { window, requests, context, set body(value) { responseBody = value; }, set selected(value) { selected = value; }, set account(value) { account = value; } };
+  return { window, requests, context, articles, set body(value) { responseBody = value; }, set selected(value) { selected = value; }, set account(value) { account = value; } };
 }
 const nativeUrl = 'https://x.com/i/api/graphql/NATIVE_ID/Bookmarks?variables=' + encodeURIComponent(JSON.stringify({ count: 20, cursor: 'old', includePromotedContent: false })) + '&features=%7B%22native%22%3Atrue%7D';
 test('bootstrap returns only native first-page bookmarks without another fetch or credentials', async () => {
@@ -98,4 +99,65 @@ test('native responses retain complete video variant metadata without treating t
   const scope = JSON.stringify(['https://x.com/i/history', 'ブックマーク', 'user']);
   const result = await h.window.__xImageBookmarkReader('posts', undefined, scope, ['101']);
   assert.equal(result.posts[0].urls.length, 0); assert.equal(result.posts[0].videos.length, 1); assert.equal(result.posts[0].videos[0].video_info.variants[0].bitrate, 2176000);
+});
+
+function mediaPost(id = '101') {
+  return { rest_id: id, legacy: { full_text: 'post', extended_entities: { media: ['A', 'B', 'C', 'D'].map(id => ({ type: 'photo', media_url_https: `https://pbs.twimg.com/media/${id}.jpg` })) } } };
+}
+function renderedArticle(id, props) {
+  const article = { parentElement: null };
+  const link = { href: `https://x.com/user/status/${id}`, querySelector: () => ({}), closest: () => article };
+  article.querySelectorAll = selector => selector === 'a[href]' ? [link] : [];
+  article.__reactFiber$test = { memoizedProps: { children: { props } }, return: null };
+  return article;
+}
+test('same-account post metadata survives client-side route and selected-tab changes', async () => {
+  const h = readerHarness(); h.selected = 'ブックマーク'; h.account = 'user'; h.body = { data: { result: mediaPost() } };
+  await h.window.fetch(nativeUrl);
+  h.context.location.href = 'https://x.com/home'; h.selected = 'おすすめ';
+  const scope = JSON.stringify(['https://x.com/home', 'おすすめ', 'user']);
+  const result = await h.window.__xImageBookmarkReader('posts', undefined, scope, ['101']);
+  assert.equal(result.posts[0].urls.length, 4); assert.equal(result.posts[0].complete, true);
+  assert.equal((await h.window.__xImageBookmarkReader('probe')).available, false);
+});
+test('initial account label mounting after 30 seconds does not expire the post list', async () => {
+  const h = readerHarness(); h.body = { data: { result: mediaPost() } };
+  await h.window.fetch(nativeUrl);
+  h.context.Date = class extends Date { static now() { return Date.now() + 60000; } };
+  h.selected = 'ブックマーク'; h.account = 'user';
+  const scope = JSON.stringify(['https://x.com/i/history', 'ブックマーク', 'user']);
+  const result = await h.window.__xImageBookmarkReader('posts', undefined, scope, ['101']);
+  assert.equal(result.posts[0].urls.length, 4);
+  h.account = 'other';
+  assert.equal((await h.window.__xImageBookmarkReader('posts', undefined, scope.replace('user', 'other'), ['101'])).posts.length, 0);
+});
+test('committed article props supply all photos and videos when native requests were missed', async () => {
+  const h = readerHarness(); h.account = 'user';
+  const target = mediaPost('202');
+  target.legacy.extended_entities.media.push({ type: 'video', id_str: '123', video_info: { variants: [{ content_type: 'video/mp4', bitrate: 1000, url: 'https://video.twimg.com/ext_tw_video/123/pu/vid/640x360/test.mp4' }] } });
+  const props = { tweet: target, quotedTweet: mediaPost('303') }; props.cycle = props;
+  h.articles.push(renderedArticle('101', { tweet: mediaPost('101') }), renderedArticle('202', props));
+  const result = await h.window.__xImageBookmarkReader('posts', undefined, JSON.stringify(['https://x.com/i/history', '', 'user']), ['202']);
+  assert.equal(result.posts.length, 1); assert.equal(result.posts[0].postId, '202');
+  assert.equal(result.posts[0].urls.length, 4); assert.equal(result.posts[0].videos.length, 1); assert.equal(result.posts[0].complete, true);
+  assert.equal(h.requests.length, 0); assert.ok(!JSON.stringify(result).includes('full_text'));
+});
+test('direct React props work but a neighboring or truncated post cannot prove a full list', async () => {
+  const h = readerHarness(); const target = mediaPost('202');
+  const article = renderedArticle('202', { tweet: mediaPost('101') }); h.articles.push(article);
+  const scope = JSON.stringify(['https://x.com/i/history', '', '']);
+  assert.equal((await h.window.__xImageBookmarkReader('posts', undefined, scope, ['202'])).posts.length, 0);
+  delete article.__reactFiber$test;
+  article.__reactProps$test = { tweet: { rest_id: '202', legacy: { full_text: 'partial', entities: { media: target.legacy.extended_entities.media.slice(0, 1) } } } };
+  assert.equal((await h.window.__xImageBookmarkReader('posts', undefined, scope, ['202'])).posts.length, 0);
+  article.__reactProps$test = { tweet: target };
+  assert.equal((await h.window.__xImageBookmarkReader('posts', undefined, scope, ['202'])).posts[0].urls.length, 4);
+});
+test('POST GraphQL responses populate post metadata without authorizing bookmark replay', async () => {
+  const h = readerHarness(); h.body = { data: { result: mediaPost() } };
+  await h.window.fetch(nativeUrl, { method: 'POST', body: '{}' });
+  const scope = JSON.stringify(['https://x.com/i/history', '', '']);
+  assert.equal((await h.window.__xImageBookmarkReader('posts', undefined, scope, ['101'])).posts[0].urls.length, 4);
+  assert.equal((await h.window.__xImageBookmarkReader('probe')).available, false);
+  assert.equal((await h.window.__xImageBookmarkReader('bootstrap')).available, false);
 });

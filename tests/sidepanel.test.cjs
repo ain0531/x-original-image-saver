@@ -26,8 +26,8 @@ function harness({ get, sendMessage } = {}) {
   const messages = [];
   const document = { getElementById: id => {
     if (!elements.has(id)) elements.set(id, {
-      value: '', checked: id !== 'specify-save-location', disabled: false, textContent: '',
-      addEventListener: (_, listener) => { elements.get(id).click = listener; },
+      value: '', checked: !['specify-save-location', 'like-on-save'].includes(id), disabled: false, textContent: '',
+      addEventListener: (event, listener) => { elements.get(id)[event] = listener; },
     });
     return elements.get(id);
   } };
@@ -108,4 +108,30 @@ test('save location checkbox defaults off and toggles only individual Save As re
   assert.equal(h.messages[1].saveAs, true);
   h.elements.get('save-all-visible').click(); await flush();
   assert.equal(h.messages[2].saveAs, false);
+});
+
+test('like checkbox defaults off, restores the shared setting and persists changes before saving', async () => {
+  const input = fs.readFileSync('sidepanel.html', 'utf8').match(/<input\b[^>]*id="like-on-save"[^>]*>/)?.[0];
+  assert.ok(input); assert.ok(!/\bchecked\b/.test(input));
+  const h = harness(); await flush();
+  assert.equal(h.elements.get('like-on-save').checked, false);
+  const restored = harness({ get: async () => ({ likeOnSave: true }) }); await flush();
+  assert.equal(restored.elements.get('like-on-save').checked, true);
+  const writes = []; let release;
+  restored.chrome.storage.local.set = async row => { writes.push(row); await new Promise(resolve => { release = resolve; }); };
+  const checkbox = restored.elements.get('like-on-save'); checkbox.checked = false; checkbox.change();
+  restored.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(writes[0].likeOnSave, false); assert.equal(restored.messages.length, 0);
+  release(); await flush(); assert.equal(restored.messages[0].type, 'SAVE_CURRENT_TWEET_IMAGES');
+});
+
+test('save-location checkbox restores and writes the shared local-save setting before a sidebar save', async () => {
+  const h = harness({ get: async () => ({ specifySaveLocation: true }) }); await flush();
+  const checkbox = h.elements.get('specify-save-location'); assert.equal(checkbox.checked, true);
+  const writes = []; let release;
+  h.chrome.storage.local.set = async row => { writes.push(row); await new Promise(resolve => { release = resolve; }); };
+  checkbox.checked = false; checkbox.change();
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(writes[0].specifySaveLocation, false); assert.equal(h.messages.length, 0);
+  release(); await flush(); assert.equal(h.messages[0].saveAs, false);
 });

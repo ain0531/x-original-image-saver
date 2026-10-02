@@ -53,7 +53,7 @@ function buttonHarness(active = true) {
     setTimeout: (callback, ms) => { const id = ++nextTimer; if (ms === 100) queueMicrotask(callback); else timeouts.set(id, callback); return id; }, clearTimeout: id => timeouts.delete(id),
   });
   vm.runInContext(fs.readFileSync('dist/post-buttons.js', 'utf8'), context);
-  return { articles, requests, document, make, get observer() { return observer; }, set active(value) { active = value; }, tick: () => intervals[0](), mutate() { observer.callback(); for (const [id, callback] of [...timeouts]) { timeouts.delete(id); callback(); } } };
+  return { articles, requests, document, chrome, make, get observer() { return observer; }, set active(value) { active = value; }, tick: () => intervals[0](), mutate() { observer.callback(); for (const [id, callback] of [...timeouts]) { timeouts.delete(id); callback(); } } };
 }
 const rows = article => article.querySelectorAll('[data-x-original-save]');
 test('button is in the action row, follows new posts, likes and bookmarks only the clicked post', async () => {
@@ -96,4 +96,50 @@ test('disabling extension removes its buttons and disconnects the observer', () 
   const h = buttonHarness(); h.active = false; h.tick();
   assert.equal(h.document.querySelectorAll('[data-x-original-save]').length, 0); assert.equal(h.observer.disconnected, true);
   const disabled = buttonHarness(false); assert.equal(disabled.document.querySelectorAll('[data-x-original-save]').length, 0);
+});
+
+test('local save sits below special save and targets only the clicked timeline post', async () => {
+  const h = buttonHarness(); h.articles.push(h.make('202')); h.mutate();
+  const row = rows(h.articles[1])[0], button = row.children[2];
+  assert.match(row.style.cssText, /flex-direction:column/);
+  assert.equal(row.children[0].textContent, '特別保存'); assert.equal(button.textContent, 'ローカル保存');
+  h.chrome.runtime.sendMessage = async message => {
+    h.requests.push(message);
+    return { ok: true, job: { id: 'job', status: 'done' }, busy: false, stats: { success: 3, skipped: 1, failed: 0 } };
+  };
+  button.click(); button.click(); await flush();
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].type, 'LOCAL_SAVE_POST'); assert.equal(h.requests[0].postId, '202');
+  assert.deepEqual(h.articles[1].clicks, []); assert.deepEqual(h.articles[0].clicks, []);
+  assert.match(row.children[3].textContent, /保存完了: 3/); assert.match(row.children[3].textContent, /保存済み: 1/);
+  assert.equal(button.disabled, false); assert.equal(button.textContent, 'ローカル保存');
+  h.mutate(); assert.equal(rows(h.articles[1]).length, 1); assert.equal(rows(h.articles[1])[0].children.length, 4);
+});
+
+test('local save monitors its job until completion and exposes download failures', async () => {
+  const h = buttonHarness(), row = rows(h.articles[0])[0], button = row.children[2];
+  h.chrome.runtime.sendMessage = async message => {
+    h.requests.push(message);
+    const done = message.type === 'GET_LOCAL_SAVE_STATUS';
+    return { ok: true, job: { id: 'job', status: done ? 'review' : 'running', endedBy: 'current-post', issues: [] }, busy: !done, stats: { success: 0, skipped: 0, failed: done ? 1 : 0 }, failures: done ? ['A: NETWORK_FAILED'] : [] };
+  };
+  button.click(); await flush(); assert.equal(button.disabled, true);
+  h.mutate(); await flush();
+  assert.equal(h.requests[1].type, 'GET_LOCAL_SAVE_STATUS'); assert.equal(h.requests[1].jobId, 'job');
+  assert.equal(h.requests[1].postId, '101'); assert.equal(button.disabled, false);
+  assert.match(row.children[3].textContent, /NETWORK_FAILED/);
+});
+
+test('local save errors remain next to that post and preserve special-save controls', async () => {
+  const h = buttonHarness(), row = rows(h.articles[0])[0];
+  h.chrome.runtime.sendMessage = async () => ({ ok: false, error: '保存処理中です。' });
+  row.children[2].click(); await flush();
+  assert.match(row.children[3].textContent, /保存処理中/); assert.equal(row.children[2].disabled, false);
+  assert.equal(row.children[0].textContent, '特別保存'); assert.deepEqual(h.articles[0].clicks, []);
+});
+
+test('recycled timeline article never saves using its old post ID', async () => {
+  const h = buttonHarness(), article = h.articles[0], row = rows(article)[0];
+  article.querySelector('a[href]').href = 'https://x.com/user/status/999';
+  row.children[2].click(); await flush(); assert.deepEqual(h.requests, []);
+  h.mutate(); assert.equal(rows(article)[0].getAttribute('data-x-original-save'), '999');
 });

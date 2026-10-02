@@ -1,4 +1,4 @@
-// Use X's own controls; this button never starts an image download.
+// Special save uses X's own controls. Local save targets this article's post ID.
 (() => {
   const instance = globalThis as any;
   if (instance.__xOriginalPostButtons) return;
@@ -7,6 +7,7 @@
   let stopped = false;
   let scheduled: ReturnType<typeof setTimeout> | undefined;
   const busy = new WeakSet<Element>();
+  const localBusy = new WeakSet<Element>();
   const observer = new MutationObserver(() => schedule());
   const timer = setInterval(() => { if (!enabled()) cleanup(); }, 1000);
   function enabled(): boolean {
@@ -73,6 +74,38 @@
       busy.delete(article); refresh(button, article);
     }
   }
+  async function localSave(button: HTMLButtonElement, status: HTMLElement, article: Element, id: string): Promise<void> {
+    if (!enabled()) { cleanup(); return; }
+    if (!article.isConnected || postId(article) !== id || localBusy.has(article)) return;
+    localBusy.add(article); button.disabled = true; button.textContent = '保存中...'; status.textContent = '画像・動画を取得しています...';
+    try {
+      let response = await chrome.runtime.sendMessage({ type: 'LOCAL_SAVE_POST', postId: id });
+      if (!response?.ok) throw new Error(response?.error ?? '応答がありません。');
+      const jobId = response.job?.id;
+      while (true) {
+        if (!enabled()) { cleanup(); return; }
+        if (!article.isConnected || postId(article) !== id) return;
+        if (response.unavailable || !response.job || response.job.id !== jobId) throw new Error('保存処理が切り替わりました。サイドパネルで状態を確認してください。');
+        const stats = response.stats;
+        button.textContent = response.queued ? '保存予約済み' : '保存中...';
+        status.textContent = response.queued ? '予約済み。順番に保存します。' : `保存完了: ${stats.success} / 保存済み: ${stats.skipped} / 失敗: ${stats.failed}`;
+        if (!response.busy && response.job.status !== 'running') {
+          if (response.job.status !== 'done') status.textContent += ` / 要確認: ${[response.job.endedBy, ...(response.job.issues ?? []), ...(response.failures ?? [])].filter(Boolean).join(' ')}`;
+          break;
+        }
+        await new Promise<void>(resolve => setTimeout(resolve, 500));
+        if (!enabled()) { cleanup(); return; }
+        if (!article.isConnected || postId(article) !== id) return;
+        response = await chrome.runtime.sendMessage({ type: 'GET_LOCAL_SAVE_STATUS', postId: id, jobId });
+        if (!response?.ok) throw new Error(response?.error ?? '応答がありません。');
+      }
+    } catch (error) {
+      if (!enabled()) { cleanup(); return; }
+      if (article.isConnected && postId(article) === id) status.textContent = `保存エラー: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      localBusy.delete(article); button.disabled = false; button.textContent = 'ローカル保存';
+    }
+  }
   function scan(): void {
     if (!enabled()) { cleanup(); return; }
     const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
@@ -88,14 +121,20 @@
       existing?.remove();
       if (!id || !group) continue;
       const row = document.createElement('div'); row.setAttribute(marker, id);
-      row.style.cssText = 'display:flex;align-items:center;gap:4px;flex-wrap:wrap;min-width:0;font:inherit;color:inherit;';
+      row.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0;font:inherit;color:inherit;';
       const button = document.createElement('button'); button.type = 'button'; button.textContent = '特別保存';
       button.setAttribute('aria-label', 'この投稿にいいねとブックマークを付ける');
       button.style.cssText = 'border:1px solid currentColor;border-radius:16px;background:transparent;color:inherit;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer;';
       const status = document.createElement('span'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); status.style.cssText = 'font-size:12px;overflow-wrap:anywhere;';
       row.append(button, status);
+      const localButton = document.createElement('button'); localButton.type = 'button'; localButton.textContent = 'ローカル保存';
+      localButton.setAttribute('aria-label', 'この投稿の画像と動画をローカルに保存する');
+      localButton.style.cssText = button.style.cssText;
+      const localStatus = document.createElement('span'); localStatus.setAttribute('role', 'status'); localStatus.setAttribute('aria-live', 'polite'); localStatus.style.cssText = status.style.cssText;
+      row.append(localButton, localStatus);
       row.addEventListener('click', event => event.stopPropagation());
       button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); if (!button.disabled) void save(button, status, article, id); });
+      localButton.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); if (!localButton.disabled) void localSave(localButton, localStatus, article, id); });
       group.appendChild(row); refresh(button, article);
     }
   }

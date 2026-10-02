@@ -59,12 +59,19 @@ export async function snapshot(tabId: number, current = false, targetPostId?: st
   if (!current) assertBookmarkScope(result.pageUrl, result.scope);
   const ids = result.posts.filter(id => /^\d+$/.test(id));
   if (ids.length) {
-    const [metadata] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', args: [ids, result.scope], func: async (ids: string[], scope: string) => {
+    const readMetadata = () => chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', args: [ids, result.scope], func: async (ids: string[], scope: string) => {
       const reader = (window as any).__xImageBookmarkReader;
-      if (!reader) return { posts: [] };
+      if (!reader) return { posts: [], readerMissing: true };
       try { return await reader('posts', undefined, scope, ids); }
       catch (error) { return { error: error instanceof Error ? error.message : String(error) }; }
     } });
+    let [metadata] = await readMetadata();
+    if (metadata?.result?.readerMissing) {
+      // An extension reload can leave an already open X page without its MAIN
+      // reader. Install our bundled code and recover from committed post props.
+      await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', files: ['dist/bookmark-reader.js'] });
+      [metadata] = await readMetadata();
+    }
     if (metadata?.result?.error) throw new Error(metadata.result.error);
     const records = metadata?.result?.posts ?? [];
     for (const id of ids) {
@@ -74,7 +81,7 @@ export async function snapshot(tabId: number, current = false, targetPostId?: st
         (result.verifiedPostIds ??= []).push(id);
         result.issues = result.issues.filter(issue => !issue.startsWith(`投稿 ${id}:`));
       }
-      else result.issues.push(`投稿 ${id}: 全画像の一覧を確認できません。表示された画像のみの保存になる可能性があります。`);
+      else result.issues.push(`投稿 ${id}: 全画像・動画の一覧を確認できません。通信情報と投稿の表示データから取得できませんでした。`);
       for (const video of record?.videos ?? []) {
         const parsed = tweetMedia(video);
         if (parsed.media) (result.media ??= []).push(parsed.media);
@@ -82,6 +89,9 @@ export async function snapshot(tabId: number, current = false, targetPostId?: st
       }
     }
     result.urls = [...new Set(result.urls)];
+    // A timeline-wide progress indicator does not mean this post's media are
+    // incomplete once the full attachment list is verified.
+    if (current && ids.every(id => result.verifiedPostIds?.includes(id))) result.loading = false;
   }
   return result;
 }
@@ -108,4 +118,32 @@ export function domPage(value: Snapshot): BookmarkPage {
     return parsed ? [parsed] : [];
   });
   return { media: [...media, ...(value.media ?? [])], ended: false, issues, posts: value.posts.length, verifiedPostIds: value.verifiedPostIds ?? [] };
+}
+// Serialize like operations for the same post and never click the unlike control.
+const likeOperations = new Map<string, Promise<void>>();
+export function likePost(tabId: number, postId: string): Promise<void> {
+  const key = tabId + ':' + postId;
+  const operation = (likeOperations.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    const [result] = await chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', args: [postId], func: async (id: string) => {
+      const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
+      const matches = (article: Element) => Array.from(article.querySelectorAll<HTMLAnchorElement>('a[href]')).some(link => link.closest('article') === article && link.querySelector('time') && new URL(link.href, location.href).pathname.match(/\/status\/(\d+)/)?.[1] === id);
+      const article = Array.from(root?.querySelectorAll('article') ?? []).find(matches);
+      if (!article) return { error: '対象投稿のいいねボタンを確認できません。' };
+      const control = (testId: string) => Array.from(article.querySelectorAll<HTMLElement>(`[data-testid="${testId}"]`)).find(node => node.closest('article') === article);
+      if (control('unlike')) return { liked: true };
+      const button = control('like');
+      if (!button || button.getAttribute('aria-disabled') === 'true' || (button as HTMLButtonElement).disabled) return { error: 'いいねボタンを操作できません。' };
+      button.click();
+      for (let attempt = 0; attempt < 25; attempt++) {
+        if (!article.isConnected || !matches(article)) return { error: 'いいねの確認中に投稿が変わりました。' };
+        if (control('unlike')) return { liked: true };
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      return { error: 'いいねの反映を確認できません。' };
+    } });
+    if (!result?.result?.liked) throw new Error(result?.result?.error ?? 'いいねの状態を確認できません。');
+  });
+  likeOperations.set(key, operation);
+  void operation.finally(() => { if (likeOperations.get(key) === operation) likeOperations.delete(key); }).catch(() => {});
+  return operation;
 }

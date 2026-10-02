@@ -7,6 +7,19 @@ const saveAllVisibleButton = document.getElementById("save-all-visible");
 const clearSavedHistoryButton = document.getElementById("clear-saved-history");
 const checkCurrentSavedListInput = document.getElementById("check-current-saved-list");
 const specifySaveLocationInput = document.getElementById('specify-save-location');
+let saveLocationSettingWrite = Promise.resolve();
+specifySaveLocationInput?.addEventListener('change', () => {
+    const checked = specifySaveLocationInput.checked;
+    saveLocationSettingWrite = saveLocationSettingWrite.catch(() => { }).then(() => chrome.storage.local.set({ specifySaveLocation: checked }));
+    void saveLocationSettingWrite.catch(error => setStatus(`設定を保存できません: ${String(error)}`));
+});
+const likeOnSaveInput = document.getElementById('like-on-save');
+let likeSettingWrite = Promise.resolve();
+likeOnSaveInput?.addEventListener('change', () => {
+    const checked = likeOnSaveInput.checked;
+    likeSettingWrite = likeSettingWrite.catch(() => { }).then(() => chrome.storage.local.set({ likeOnSave: checked }));
+    void likeSettingWrite.catch(error => setStatus(`設定を保存できません: ${String(error)}`));
+});
 const checkAllSavedListInput = document.getElementById("check-all-saved-list");
 const statusElement = document.getElementById("status");
 function setStatus(message) {
@@ -37,7 +50,11 @@ async function getSavedMediaCount() {
     return Object.keys(stored).filter(key => key.startsWith('savedImage:') || key.startsWith('savedVideo:')).length;
 }
 async function initializeSidePanel() {
-    await chrome.storage.local.get('imageSaverOptions');
+    const stored = await chrome.storage.local.get(['imageSaverOptions', 'likeOnSave', 'specifySaveLocation']);
+    if (specifySaveLocationInput)
+        specifySaveLocationInput.checked = stored.specifySaveLocation === true;
+    if (likeOnSaveInput)
+        likeOnSaveInput.checked = stored.likeOnSave === true;
     if (checkCurrentSavedListInput) {
         checkCurrentSavedListInput.checked = true;
     }
@@ -46,6 +63,8 @@ async function initializeSidePanel() {
     }
 }
 bindAction(saveCurrentTweetButton, async () => {
+    await likeSettingWrite;
+    await saveLocationSettingWrite;
     const activeTab = await getActiveTab();
     if (!activeTab?.id) {
         setStatus("開いているタブを確認できません。");
@@ -107,7 +126,7 @@ function renderProgress(response) {
     const job = response.job;
     jobActive = job?.status === 'running';
     workerBusy = response.busy === true;
-    watchProgress = jobActive || response.busy === true;
+    watchProgress = jobActive || response.busy === true || (response.localQueue?.pending ?? 0) > 0;
     const source = job?.source === 'direct' ? 'ブックマークのデータを取得（タブなし）' : job?.source === 'network' ? 'ブックマークの投稿データを直接取得（スクロールなし）' : job?.source === 'loaded' ? '読み込み済み画像のみ（スクロールなし）' : '現在の投稿';
     const reasons = {
         'timeline-end': '投稿データの末尾まで取得', 'max-rounds': '取得ページ数の上限。続きは未取得',
@@ -117,7 +136,7 @@ function renderProgress(response) {
     const stats = response.stats ?? { total: 0, skipped: 0, success: 0, failed: 0 };
     const title = !job ? '待機中' : jobActive ? '取得・保存中' : job.status === 'done' ? (stats.canceled ? '対象範囲の処理終了（キャンセルあり）' : '対象範囲の保存完了') : '停止・要確認';
     setStatus([formatStats(title, stats), job ? `経路: ${source}\n取得ページ: ${job.rounds}\n保存待ち・転送中: ${stats.pending ?? 0}\n${reasons[job.endedBy] ?? job.endedBy}` : '',
-        ...(job?.issues ?? []), ...(response.failures ?? [])].filter(Boolean).join('\n'));
+        ...(job?.issues ?? []), ...(response.failures ?? []), response.localQueue ? `ローカル保存の予約・処理中: ${response.localQueue.pending} / 要確認: ${response.localQueue.review}（対象投稿から再試行）` : ''].filter(Boolean).join('\n'));
     if (pauseButton)
         pauseButton.disabled = !jobActive;
     if (resumeButton)

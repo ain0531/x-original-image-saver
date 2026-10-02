@@ -38,16 +38,24 @@
             return false;
         }
     };
-    const remember = (body, requestScope) => {
+    const postCompatible = (before, after) => {
+        const a = JSON.parse(before), b = JSON.parse(after);
+        // A post ID's media do not depend on route or selected timeline. Keep the
+        // account boundary; initially blank account labels may settle on this page.
+        return a[2] ? a[2] === b[2] : a[0] === b[0];
+    };
+    const remember = (body, requestScope, onlyId, rendered = false) => {
         if (!compatible(requestScope, scope()))
             return;
         let nodes = 0;
+        const seen = new WeakSet();
         const visit = (value, depth) => {
-            if (!value || typeof value !== 'object' || depth > 30 || ++nodes > 30000)
+            if (!value || typeof value !== 'object' || depth > 30 || ++nodes > 30000 || seen.has(value))
                 return;
+            seen.add(value);
             const legacy = value.legacy ?? value;
             const id = value.rest_id ?? legacy.id_str;
-            if (typeof id === 'string' && /^\d+$/.test(id) && (typeof legacy.full_text === 'string' || legacy.extended_entities?.media || legacy.entities?.media)) {
+            if (typeof id === 'string' && /^\d+$/.test(id) && (!onlyId || id === onlyId) && (typeof legacy.full_text === 'string' || legacy.extended_entities?.media || legacy.extended_tweet?.extended_entities?.media || legacy.entities?.media) && (!rendered || Array.isArray(legacy.extended_entities?.media) || Array.isArray(legacy.extended_tweet?.extended_entities?.media))) {
                 const full = [legacy.extended_entities?.media, legacy.extended_tweet?.extended_entities?.media].filter(Array.isArray);
                 const items = full.length ? full.flat() : legacy.entities?.media ?? [];
                 const urls = new Set();
@@ -75,17 +83,54 @@
                 const complete = valid && (full.length > 0 || !(legacy.entities?.media?.length));
                 const old = postImages.get(id);
                 // A truncated result must not replace a previously observed full list.
-                if (!old || !compatible(old.scope, scope()) || complete || !old.complete) {
+                if (!old || !postCompatible(old.scope, scope()) || complete || !old.complete) {
                     postImages.delete(id);
                     postImages.set(id, { postId: id, urls: [...urls], videos, complete, scope: scope(), at: Date.now() });
                 }
                 while (postImages.size > 2000)
                     postImages.delete(postImages.keys().next().value);
             }
-            for (const child of Object.values(value))
-                visit(child, depth + 1);
+            for (const [key, child] of Object.entries(value))
+                if (!['_owner', 'return', 'stateNode', 'alternate', 'child', 'sibling', 'ref'].includes(key))
+                    visit(child, depth + 1);
         };
         visit(body, 0);
+    };
+    const renderedPost = (id, current) => {
+        const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
+        const article = Array.from(root?.querySelectorAll?.('article') ?? []).find(article => {
+            const link = Array.from(article.querySelectorAll('a[href]')).find(link => link.querySelector('time') && link.closest('article') === article);
+            try {
+                return !!link && new URL(link.href, location.href).pathname.match(/\/status\/(\d+)/)?.[1] === id;
+            }
+            catch {
+                return false;
+            }
+        });
+        if (!article)
+            return;
+        // Read only committed props for this article. Never execute React callbacks
+        // or inspect a different post's metadata as a substitute.
+        const complete = () => { const record = postImages.get(id); return !!record?.complete && postCompatible(record.scope, current); };
+        const inspected = new WeakSet();
+        let node = article;
+        for (let parent = 0; node && parent < 4; parent++, node = node.parentElement) {
+            for (const key of Object.keys(node)) {
+                if (key.startsWith('__reactProps$'))
+                    remember(node[key], current, id, true);
+                if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) {
+                    let fiber = node[key];
+                    for (let step = 0; fiber && typeof fiber === 'object' && step < 24 && !inspected.has(fiber); step++, fiber = fiber.return) {
+                        inspected.add(fiber);
+                        remember(fiber.memoizedProps, current, id, true);
+                        if (complete())
+                            return;
+                    }
+                }
+                if (complete())
+                    return;
+            }
+        }
     };
     const capture = (url, headers, requestScope) => {
         if (!compatible(requestScope, scope()))
@@ -109,16 +154,17 @@
     window.fetch = async (input, init) => {
         const url = input instanceof Request ? input.url : String(input);
         const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-        if (!observes(url) || method.toUpperCase() !== 'GET')
+        if (!observes(url) || !['GET', 'POST'].includes(method.toUpperCase()))
             return nativeFetch(input, init);
         const headers = new Headers(input instanceof Request ? input.headers : undefined);
         new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
         const requestScope = scope();
         const response = await nativeFetch(input, init);
         if (response.ok) {
-            if (accepts(url))
+            if (method.toUpperCase() === 'GET' && accepts(url))
                 capture(url, headers, requestScope);
-            void response.clone().json().then(body => { remember(body, requestScope); rememberInitial(url, body, requestScope); }).catch(() => { });
+            void response.clone().json().then(body => { remember(body, requestScope); if (method.toUpperCase() === 'GET')
+                rememberInitial(url, body, requestScope); }).catch(() => { });
         }
         return response;
     };
@@ -129,8 +175,8 @@
     const requests = new WeakMap();
     XMLHttpRequest.prototype.open = function (method, url, ...args) {
         requests.delete(this);
-        if (method.toUpperCase() === 'GET' && observes(String(url)))
-            requests.set(this, { url: String(url), headers: new Headers(), scope: scope() });
+        if (['GET', 'POST'].includes(method.toUpperCase()) && observes(String(url)))
+            requests.set(this, { url: String(url), method: method.toUpperCase(), headers: new Headers(), scope: scope() });
         return open.call(this, method, url, ...args);
     };
     XMLHttpRequest.prototype.setRequestHeader = function (key, value) {
@@ -143,11 +189,12 @@
             this.addEventListener('load', () => {
                 try {
                     if (this.status >= 200 && this.status < 300) {
-                        if (accepts(request.url))
+                        if (request.method === 'GET' && accepts(request.url))
                             capture(request.url, request.headers, request.scope);
                         const data = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
                         remember(data, request.scope);
-                        rememberInitial(request.url, data, request.scope);
+                        if (request.method === 'GET')
+                            rememberInitial(request.url, data, request.scope);
                     }
                 }
                 catch { /* A malformed response cannot establish the source. */ }
@@ -166,8 +213,12 @@
             if (expectedScope !== current)
                 throw new Error('画像取得中にページ・アカウントが変わりました。');
             const posts = (postIds ?? []).slice(0, 200).flatMap(id => {
-                const record = postImages.get(id);
-                if (!record || (record.scope !== current && !(Date.now() - record.at < 30000 && compatible(record.scope, current))))
+                let record = postImages.get(id);
+                if (!record?.complete || !postCompatible(record.scope, current)) {
+                    renderedPost(id, current);
+                    record = postImages.get(id);
+                }
+                if (!record || !postCompatible(record.scope, current))
                     return [];
                 record.scope = current;
                 return [{ postId: record.postId, urls: record.urls, videos: record.videos, complete: record.complete }];
