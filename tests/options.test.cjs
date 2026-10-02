@@ -24,11 +24,14 @@ test('saved options control batch page limits and real download filenames', asyn
   await h.request({ type: 'RESUME_SAVE' }); await h.done();
   assert.equal(h.calls[1].filename, 'X画像/ブックマーク/X_B.jpg');
 });
-test('current post applies the configured folder and name and keeps Save As', async () => {
-  const h = harness({ imageSaverOptions: { ...defaults, folder: 'X画像', fileName: '{mediaId}_保存.{format}' } });
-  h.snap.urls = ['https://pbs.twimg.com/media/A.jpg'];
-  await h.request({ type: 'SAVE_CURRENT_TWEET_IMAGES', tabId: 1 }); await h.done();
-  assert.equal(h.calls[0].filename, 'X画像/A_保存.jpg'); assert.equal(h.calls[0].saveAs, true);
+test('current post uses configured files and shows Save As only when explicitly requested', async () => {
+  for (const saveAs of [undefined, false, true]) {
+    const h = harness({ imageSaverOptions: { ...defaults, folder: 'X画像', fileName: '{mediaId}_保存.{format}' } });
+    h.snap.urls = ['https://pbs.twimg.com/media/A.jpg'];
+    await h.request({ type: 'SAVE_CURRENT_TWEET_IMAGES', tabId: 1, saveAs }); await h.done();
+    assert.equal(h.calls[0].filename, 'X画像/A_保存.jpg'); assert.equal(h.calls[0].saveAs, saveAs === true);
+    assert.equal(h.store.imageSaveJob.saveAs, saveAs === true);
+  }
 });
 test('options form loads, validates and persists the settings', async () => {
   const h = harness(); const elements = new Map();

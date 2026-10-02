@@ -58,22 +58,28 @@
   </head>
   <body>
     <h1>X 原寸画像保存</h1>
-    <p style="font-size:12px">スクロールせずに保存します。ブックマークの投稿データを取得できない場合は、読み込み済み画像のみが対象です。</p>
+    <p id="version" style="font-size:12px"></p>
+    <p style="font-size:12px">通常はデータ通信でブックマークの画像・動画を保存します。初回取得に必要な場合だけタブを一時的に開き、通信後に自動で閉じます。画像は原寸、動画は取得できたMP4の最高ビットレートを選びます。HLSのみの動画は未対応です。</p>
 
     <div class="button-group">
       <div class="action-row">
-        <button id="save-current-tweet">現在の投稿の画像を保存</button>
+        <button id="save-current-tweet">現在の投稿の画像・動画を保存</button>
+        <label class="action-option">
+          <input id="specify-save-location" type="checkbox" />
+          保存先を指定
+        </label>
         <label class="action-option">
           <input id="check-current-saved-list" type="checkbox" checked disabled />
-          画像IDで保存済みを確認（常に有効）
+          メディアIDで保存済みを確認（常に有効）
         </label>
       </div>
 
       <div class="action-row">
         <button id="save-all-visible">画像をまとめて保存</button>
+        <p style="margin:0;font-size:12px;color:#333">ブックマークに保存された投稿から動画と画像を保存します。</p>
         <label class="action-option">
           <input id="check-all-saved-list" type="checkbox" checked disabled />
-          画像IDで保存済みを確認（常に有効）
+          メディアIDで保存済みを確認（常に有効）
         </label>
       </div>
 

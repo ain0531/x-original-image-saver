@@ -197,25 +197,27 @@ test('missing login stops without opening tabs or downloading', async () => {
   const result = await start(h); assert.equal(result.ok, false); assert.match(result.error, /ログイン/);
   assert.deepEqual(h.createdTabs, []); assert.equal(h.calls.length, 0);
 });
-test('unsupported X client settings stop without DOM or tab fallback', async () => {
+test('unsupported X client settings report failure if the initialization tab cannot open', async () => {
   const h = harness(); h.snap.urls = [url('DOM_ONLY')];
   h.context.fetch = async () => ({ ok: true, url: 'https://x.com/i/bookmarks', text: async () => '<html>Unknown client</html>' });
-  const result = await start(h); assert.equal(result.ok, false); assert.match(result.error, /取得先/);
+  h.chrome.tabs.create = async () => { throw new Error('Initialization tab unavailable'); };
+  const result = await start(h); assert.equal(result.ok, false); assert.match(result.error, /Initialization tab unavailable/);
   assert.equal(h.createdTabs.length, 0); assert.equal(h.calls.length, 0); assert.equal(h.injections.length, 0);
 });
-test('background preparation timeout stops without starting a job or a tab', async () => {
+test('background preparation timeout reports failure when initialization tab is unavailable', async () => {
   const h = harness();
   h.context.setTimeout = (callback, ms) => { if (ms === 15000) queueMicrotask(callback); return 1; };
   h.context.clearTimeout = () => {};
   h.context.fetch = async (_, init) => new Promise((resolve, reject) => { init.signal.addEventListener('abort', () => reject(new Error('Aborted'))); });
+  h.chrome.tabs.create = async () => { throw new Error('Initialization tab unavailable'); };
   const result = await start(h);
-  assert.equal(result.ok, false); assert.match(result.error, /時間切れ/);
+  assert.equal(result.ok, false); assert.match(result.error, /Initialization tab unavailable/);
   assert.equal(h.createdTabs.length, 0); assert.equal(h.calls.length, 0); assert.equal(h.store.imageSaveJob, undefined);
 });
 test('current-post saving does not create a background bookmark tab', async () => {
   const h = harness(); h.snap.pageUrl = 'https://x.com/home'; h.snap.urls = [url('CURRENT')];
   assert.equal((await h.request({ type: 'SAVE_CURRENT_TWEET_IMAGES', tabId: 1 })).ok, true); await h.done();
-  assert.equal(h.createdTabs.length, 0); assert.equal(h.calls[0].url, url('CURRENT')); assert.equal(h.calls[0].saveAs, true);
+  assert.equal(h.createdTabs.length, 0); assert.equal(h.calls[0].url, url('CURRENT')); assert.equal(h.calls[0].saveAs, false);
 });
 test('bookmark page recognition accepts legacy, folders, history bookmarks and English tabs', () => {
   const h = harness();

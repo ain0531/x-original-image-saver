@@ -17,6 +17,7 @@
 </head>
 <body>
   <h1>オプション</h1>
+  <p id="version" class="help"></p>
   <p>設定は、次に開始する保存処理から反映されます。実行中・再開中の処理は開始時の設定を使います。</p>
   <form id="options-form">
     <section aria-labelledby="limits-title">
@@ -26,7 +27,7 @@
       <p class="help">ページ数は投稿数とは異なります。上限で止まった場合は、続きから再開できます。</p>
       <label for="max-seconds">取得時間の上限（秒）</label>
       <input id="max-seconds" type="number" min="1" max="300" step="1" required disabled>
-      <p class="help">取得済み画像の保存は、取得が止まった後も継続します。</p>
+      <p class="help">取得済みの画像・動画の保存は、取得が止まった後も継続します。</p>
     </section>
     <section aria-labelledby="files-title">
       <h2 id="files-title">保存ファイルの設定</h2>
@@ -36,9 +37,9 @@
       <button id="open-download-settings" type="button">Chromeのダウンロード設定を開く</button>
       <label for="file-name">ファイル名の形式</label>
       <input id="file-name" type="text" maxlength="150" required disabled>
-      <p class="help">{mediaId}は画像ID、{format}は拡張子に置き換わります。例：{mediaId}_orig.{format}。同名ファイルは上書きしません。</p>
+      <p class="help">{mediaId}は画像・動画のID、{format}は拡張子に置き換わります。動画は.mp4です。例：{mediaId}_orig.{format}。動画の_origは命名形式であり、元のアップロードファイルを意味しません。同名ファイルは上書きしません。</p>
       <p id="preview" class="help"></p>
-      <p class="help">「現在の投稿の画像を保存」では、ここで指定した名前・フォルダを候補として保存先ダイアログを開きます。Chromeの保存先確認設定によっては、一括保存でも確認が表示されます。</p>
+      <p class="help">「現在の投稿の画像・動画を保存」は、初期状態ではここで指定した名前・フォルダへ自動保存します。ボタン下の「保存先を指定」をONにすると、保存先ダイアログで手動選択できます。</p>
     </section>
     <button id="save-options" type="submit" disabled>設定を保存</button>
   </form>

@@ -1,8 +1,12 @@
 const LEGACY_STORAGE_KEY_SAVED_MEDIA = "savedMediaKeys";
+const versionElement = document.getElementById('version');
+if (versionElement)
+    versionElement.textContent = `バージョン ${chrome.runtime.getManifest?.()?.version ?? ''}`;
 const saveCurrentTweetButton = document.getElementById("save-current-tweet");
 const saveAllVisibleButton = document.getElementById("save-all-visible");
 const clearSavedHistoryButton = document.getElementById("clear-saved-history");
 const checkCurrentSavedListInput = document.getElementById("check-current-saved-list");
+const specifySaveLocationInput = document.getElementById('specify-save-location');
 const checkAllSavedListInput = document.getElementById("check-all-saved-list");
 const statusElement = document.getElementById("status");
 function setStatus(message) {
@@ -14,10 +18,11 @@ function formatStats(title, stats) {
     return [
         title,
         "",
-        `検出画像: ${stats.total}`,
+        `検出ファイル: ${stats.total}`,
         `保存済みスキップ: ${stats.skipped}`,
         `保存完了: ${stats.success}`,
         `保存失敗: ${stats.failed}`,
+        `キャンセル: ${stats.canceled ?? 0}`,
     ].join("\n");
 }
 async function getActiveTab() {
@@ -29,7 +34,7 @@ async function getActiveTab() {
 }
 async function getSavedMediaCount() {
     const stored = await chrome.storage.local.get(null);
-    return Object.keys(stored).filter(key => key.startsWith('savedImage:')).length;
+    return Object.keys(stored).filter(key => key.startsWith('savedImage:') || key.startsWith('savedVideo:')).length;
 }
 async function initializeSidePanel() {
     await chrome.storage.local.get('imageSaverOptions');
@@ -46,12 +51,12 @@ bindAction(saveCurrentTweetButton, async () => {
         setStatus("開いているタブを確認できません。");
         return;
     }
-    setStatus("現在の投稿の画像を保存しています...");
+    setStatus("現在の投稿の画像・動画を保存しています...");
     const response = (await chrome.runtime.sendMessage({
         type: "SAVE_CURRENT_TWEET_IMAGES",
         tabId: activeTab.id,
         tabUrl: activeTab.url ?? "",
-        saveAs: true,
+        saveAs: specifySaveLocationInput?.checked === true,
         skipPreviouslySaved: checkCurrentSavedListInput?.checked ?? true,
     }));
     if (!response?.ok) {
@@ -66,7 +71,7 @@ bindAction(saveAllVisibleButton, async () => {
         setStatus("開いているタブを確認できません。");
         return;
     }
-    setStatus("タブを開かずにブックマークのデータ取得を準備しています...");
+    setStatus("ブックマークの初回データを取得しています。必要な場合は取得用タブを一時的に開き、通信後に自動で閉じます...");
     const response = (await chrome.runtime.sendMessage({
         type: "SAVE_ALL_VISIBLE_IMAGES",
         tabId: activeTab.id,
@@ -110,7 +115,7 @@ function renderProgress(response) {
         'current-post': '現在の投稿のみ', 'user-paused': '一時停止',
     };
     const stats = response.stats ?? { total: 0, skipped: 0, success: 0, failed: 0 };
-    const title = !job ? '待機中' : jobActive ? '取得・保存中' : job.status === 'done' ? '対象範囲の保存完了' : '停止・要確認';
+    const title = !job ? '待機中' : jobActive ? '取得・保存中' : job.status === 'done' ? (stats.canceled ? '対象範囲の処理終了（キャンセルあり）' : '対象範囲の保存完了') : '停止・要確認';
     setStatus([formatStats(title, stats), job ? `経路: ${source}\n取得ページ: ${job.rounds}\n保存待ち・転送中: ${stats.pending ?? 0}\n${reasons[job.endedBy] ?? job.endedBy}` : '',
         ...(job?.issues ?? []), ...(response.failures ?? [])].filter(Boolean).join('\n'));
     if (pauseButton)

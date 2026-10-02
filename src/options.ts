@@ -1,4 +1,6 @@
 import { OPTIONS_KEY, getOptions, validateOptions, downloadFileName } from './preferences.js';
+const versionElement = document.getElementById('version');
+if (versionElement) versionElement.textContent = `バージョン ${chrome.runtime.getManifest?.()?.version ?? ''}`;
 const form = document.getElementById('options-form') as HTMLFormElement;
 const maxPages = document.getElementById('max-pages') as HTMLInputElement;
 const maxSeconds = document.getElementById('max-seconds') as HTMLInputElement;
@@ -9,7 +11,7 @@ const status = document.getElementById('status')!;
 const preview = document.getElementById('preview')!;
 function read() { return validateOptions({ maxPages: Number(maxPages.value), maxSeconds: Number(maxSeconds.value), folder: folder.value, fileName: fileName.value }); }
 function showPreview() {
-  try { const options = read(); preview.textContent = `保存例：ダウンロード先 / ${downloadFileName({ mediaId: 'IMAGE123', format: 'jpg', origUrl: '' }, options)}`; }
+  try { const options = read(); preview.textContent = `画像：ダウンロード先 / ${downloadFileName({ mediaId: 'IMAGE123', format: 'jpg', origUrl: '' }, options)}\n動画：ダウンロード先 / ${downloadFileName({ kind: 'video', mediaId: '1234567890', format: 'mp4', origUrl: '' }, options)}`; }
   catch (error) { preview.textContent = error instanceof Error ? error.message : String(error); }
 }
 form.addEventListener('input', showPreview);

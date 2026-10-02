@@ -1,4 +1,7 @@
 import { OPTIONS_KEY, getOptions, validateOptions, downloadFileName } from './preferences.js';
+const versionElement = document.getElementById('version');
+if (versionElement)
+    versionElement.textContent = `バージョン ${chrome.runtime.getManifest?.()?.version ?? ''}`;
 const form = document.getElementById('options-form');
 const maxPages = document.getElementById('max-pages');
 const maxSeconds = document.getElementById('max-seconds');
@@ -11,7 +14,7 @@ function read() { return validateOptions({ maxPages: Number(maxPages.value), max
 function showPreview() {
     try {
         const options = read();
-        preview.textContent = `保存例：ダウンロード先 / ${downloadFileName({ mediaId: 'IMAGE123', format: 'jpg', origUrl: '' }, options)}`;
+        preview.textContent = `画像：ダウンロード先 / ${downloadFileName({ mediaId: 'IMAGE123', format: 'jpg', origUrl: '' }, options)}\n動画：ダウンロード先 / ${downloadFileName({ kind: 'video', mediaId: '1234567890', format: 'mp4', origUrl: '' }, options)}`;
     }
     catch (error) {
         preview.textContent = error instanceof Error ? error.message : String(error);

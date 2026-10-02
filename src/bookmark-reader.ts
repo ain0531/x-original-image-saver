@@ -5,7 +5,8 @@
   const nativeFetch = window.fetch.bind(window);
   type Template = { url: string; headers: Headers; scope: string; at: number };
   let template: Template | undefined;
-  type PostImages = { postId: string; urls: string[]; complete: boolean; scope: string; at: number };
+  let initialPage: { data: unknown; scope: string } | undefined;
+  type PostImages = { postId: string; urls: string[]; videos: any[]; complete: boolean; scope: string; at: number };
   const postImages = new Map<string, PostImages>();
   const scope = () => {
     const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
@@ -40,9 +41,13 @@
         const full = [legacy.extended_entities?.media, legacy.extended_tweet?.extended_entities?.media].filter(Array.isArray);
         const items = full.length ? full.flat() : legacy.entities?.media ?? [];
         const urls = new Set<string>();
+        const videos: any[] = [];
         let valid = true;
         for (const item of items) {
-          if (item.type === 'video' || item.type === 'animated_gif') continue;
+          if (item.type === 'video' || item.type === 'animated_gif') {
+            videos.push({ type: item.type, id_str: item.id_str, media_key: item.media_key, video_info: { variants: Array.isArray(item.video_info?.variants) ? item.video_info.variants.map((variant: any) => ({ bitrate: variant.bitrate, content_type: variant.content_type, url: variant.url })) : [] } });
+            continue;
+          }
           const raw = item.media_url_https ?? item.media_url;
           try {
             const url = new URL(raw);
@@ -54,7 +59,7 @@
         const old = postImages.get(id);
         // A truncated result must not replace a previously observed full list.
         if (!old || !compatible(old.scope, scope()) || complete || !old.complete) {
-          postImages.delete(id); postImages.set(id, { postId: id, urls: [...urls], complete, scope: scope(), at: Date.now() });
+          postImages.delete(id); postImages.set(id, { postId: id, urls: [...urls], videos, complete, scope: scope(), at: Date.now() });
         }
         while (postImages.size > 2000) postImages.delete(postImages.keys().next().value!);
       }
@@ -67,6 +72,15 @@
     // A response for a different tab/account must never authorize a bookmark scan.
     template = { url, headers, scope: scope(), at: Date.now() };
   };
+  const rememberInitial = (url: string, body: unknown, requestScope: string) => {
+    if (!accepts(url) || !compatible(requestScope, scope())) return;
+    const endpoint = new URL(url, location.href);
+    if (!endpoint.pathname.endsWith('/Bookmarks')) return;
+    try {
+      if (JSON.parse(endpoint.searchParams.get('variables')!).cursor) return;
+      initialPage = { data: body, scope: requestScope };
+    } catch { /* Only a proven first page can initialize a batch. */ }
+  };
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = input instanceof Request ? input.url : String(input);
     const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
@@ -77,7 +91,7 @@
     const response = await nativeFetch(input, init);
     if (response.ok) {
       if (accepts(url)) capture(url, headers, requestScope);
-      void response.clone().json().then(body => remember(body, requestScope)).catch(() => {});
+      void response.clone().json().then(body => { remember(body, requestScope); rememberInitial(url, body, requestScope); }).catch(() => {});
     }
     return response;
   };
@@ -101,22 +115,27 @@
       try {
         if (this.status >= 200 && this.status < 300) {
           if (accepts(request.url)) capture(request.url, request.headers, request.scope);
-          remember(this.responseType === 'json' ? this.response : JSON.parse(this.responseText), request.scope);
+          const data = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
+          remember(data, request.scope); rememberInitial(request.url, data, request.scope);
         }
       } catch { /* A malformed response cannot establish the source. */ }
     }, { once: true });
     return send.call(this, body);
   };
   let busy = false;
-  host.__xImageBookmarkReader = async (operation: 'probe' | 'page' | 'posts', cursor?: string, expectedScope?: string, postIds?: string[]) => {
+  host.__xImageBookmarkReader = async (operation: 'probe' | 'page' | 'posts' | 'bootstrap', cursor?: string, expectedScope?: string, postIds?: string[]) => {
     const current = scope();
+    if (operation === 'bootstrap') {
+      if (!initialPage || !compatible(initialPage.scope, current)) return { available: false, scope: current, documentId: performance.timeOrigin };
+      return { available: true, scope: current, documentId: performance.timeOrigin, data: initialPage.data };
+    }
     if (operation === 'posts') {
       if (expectedScope !== current) throw new Error('画像取得中にページ・アカウントが変わりました。');
       const posts = (postIds ?? []).slice(0, 200).flatMap(id => {
         const record = postImages.get(id);
         if (!record || (record.scope !== current && !(Date.now() - record.at < 30000 && compatible(record.scope, current)))) return [];
         record.scope = current;
-        return [{ postId: record.postId, urls: record.urls, complete: record.complete }];
+        return [{ postId: record.postId, urls: record.urls, videos: record.videos, complete: record.complete }];
       });
       return { posts, scope: current };
     }

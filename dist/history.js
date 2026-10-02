@@ -1,4 +1,4 @@
-import { isOriginalDownload, parseMediaUrl } from "./media.js";
+import { isOriginalDownload, isMediaDownload, parseMediaUrl, mediaKey, historyKey } from "./media.js";
 const HISTORY_PREFIX = "savedImage:";
 const MIGRATED = "imageHistoryMigratedV2";
 const INDEXED = 'imageHistoryDownloadIndexV1';
@@ -72,21 +72,21 @@ export class ImageHistory {
         let stored;
         try {
             await this.ensure();
-            stored = await chrome.storage.local.get(media.map(m => HISTORY_PREFIX + m.mediaId));
+            stored = await chrome.storage.local.get(media.map(historyKey));
         }
         catch {
-            return new Map(media.map(m => [m.mediaId, null]));
+            return new Map(media.map(m => [mediaKey(m), null]));
         }
         await Promise.all(media.map(async (m) => {
             let confirmed = null;
-            const key = HISTORY_PREFIX + m.mediaId;
+            const key = historyKey(m);
             const record = stored[key];
             try {
                 if (record && Number.isFinite(record.savedAt) && record.savedAt > 0 && record.savedAt <= Date.now()) {
-                    if (record.quality === "orig") {
+                    if (record.quality === (m.kind === 'video' ? 'best-mp4' : 'orig')) {
                         confirmed = record.downloadId ?? 0;
                     }
-                    else if (record.quality === "unknown") {
+                    else if (record.quality === "unknown" && m.kind !== 'video') {
                         // Old records can contain large fallbacks. Verify an original;
                         // an unknown or unreadable record is never a reason to skip.
                         const items = await chrome.downloads.search({ urlRegex: `/media/${m.mediaId}(?:[?.:])`, limit: 0 });
@@ -101,23 +101,23 @@ export class ImageHistory {
             catch {
                 confirmed = null;
             }
-            result.set(m.mediaId, confirmed);
+            result.set(mediaKey(m), confirmed);
         }));
         return result;
     }
     async record(media, downloadId) {
         await this.ensure();
         const [item] = await chrome.downloads.search({ id: downloadId });
-        if (!isOriginalDownload(item, media.mediaId))
-            throw new Error("原寸画像の完了・ファイル存在を確認できません。");
-        await chrome.storage.local.set({ [HISTORY_PREFIX + media.mediaId]: {
-                savedAt: Date.now(), quality: "orig", downloadId, url: item.url,
+        if (!isMediaDownload(item, media))
+            throw new Error("保存ファイルの完了・形式・存在を確認できません。");
+        await chrome.storage.local.set({ [historyKey(media)]: {
+                savedAt: Date.now(), quality: media.kind === 'video' ? 'best-mp4' : 'orig', downloadId, url: item.url, ...(media.kind === 'video' ? { bitrate: media.bitrate } : {}),
             } });
     }
     async clear() {
         await this.ensure();
         const stored = await chrome.storage.local.get(null);
-        const keys = Object.keys(stored).filter(key => key.startsWith(HISTORY_PREFIX));
+        const keys = Object.keys(stored).filter(key => key.startsWith(HISTORY_PREFIX) || key.startsWith('savedVideo:'));
         if (keys.length)
             await chrome.storage.local.remove(keys);
         return keys.length;

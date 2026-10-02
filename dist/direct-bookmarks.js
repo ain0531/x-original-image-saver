@@ -1,6 +1,9 @@
 import { parseBookmarkPage } from './bookmarks.js';
+import { network, assertBookmarkScope } from './sources.js';
 const DIRECT_KEY = 'bookmarkDirect:';
 const ORIGIN = 'https://x.com';
+const BOOTSTRAP_TAB_KEY = 'bookmarkBootstrapTab';
+const BOOTSTRAP_READY_KEY = 'bookmarkBootstrapReady:';
 const validRoute = (raw) => {
     try {
         const u = new URL(raw);
@@ -36,6 +39,8 @@ export function clientBookmarkConfig(text, values) {
 export class DirectBookmarks {
     constructor() {
         this.captures = Promise.resolve();
+        this.initialPages = new Map();
+        this.recovery = this.cleanupBootstrap().catch(() => { });
         chrome.webRequest.onBeforeSendHeaders.addListener(details => {
             if (details.method !== 'GET' || details.tabId < 0)
                 return;
@@ -111,7 +116,7 @@ export class DirectBookmarks {
         const old = saved?.scope === identity.scope ? saved : undefined;
         if (old?.route && validRoute(old.route) && old.authorization && Date.now() - old.at < 3600000)
             return old;
-        // Fetch text only. Never navigate a tab, execute remote code, or embed X.
+        // Try text-only discovery before resorting to a temporary native X page.
         const response = await this.request(ORIGIN + '/i/bookmarks', { credentials: 'include' });
         if (/\/login|\/i\/flow\/login/.test(response.url))
             throw new Error('Xにログインしてから再試行してください。');
@@ -132,9 +137,95 @@ export class DirectBookmarks {
                 return result;
             }
         }
-        throw new Error('Xのブックマーク取得先を確認できません。ログイン済みのXを再読み込みして再試行してください。タブは自動で開きません。');
+        throw new Error('Xのブックマーク取得先を確認できません。');
+    }
+    async cleanupBootstrap() {
+        const stored = (await chrome.storage.session.get(BOOTSTRAP_TAB_KEY))[BOOTSTRAP_TAB_KEY];
+        if (!stored || !Number.isInteger(stored.tabId) || stored.tabId < 0)
+            return;
+        try {
+            await chrome.tabs.remove(stored.tabId);
+        }
+        catch {
+            try {
+                await chrome.tabs.get(stored.tabId);
+            }
+            catch {
+                await chrome.storage.session.remove(BOOTSTRAP_TAB_KEY);
+                return;
+            }
+            throw new Error('初回取得用タブを閉じられませんでした。タブを閉じて再試行してください。');
+        }
+        await chrome.storage.session.remove(BOOTSTRAP_TAB_KEY);
+    }
+    async bootstrap(identity, originalTabId) {
+        const original = await chrome.tabs.get(originalTabId);
+        // Only tabs created here are owned and closed. Existing user tabs stay open.
+        const tab = await chrome.tabs.create({ windowId: original.windowId, url: ORIGIN + '/i/bookmarks', active: false });
+        if (tab.id === undefined)
+            throw new Error('初回取得用タブを開けませんでした。');
+        try {
+            await chrome.storage.session.set({ [BOOTSTRAP_TAB_KEY]: { tabId: tab.id } });
+            const deadline = Date.now() + 30000;
+            while (Date.now() < deadline) {
+                await this.check(identity.storeId, identity.scope);
+                const live = await chrome.tabs.get(tab.id);
+                const url = live.url ?? '';
+                if (/\/login|\/i\/flow\/login/.test(url))
+                    throw new Error('Xにログインしてから再試行してください。');
+                if (url.startsWith(ORIGIN + '/i/bookmarks') || url === ORIGIN + '/i/history') {
+                    // The document-start reader returns native JSON, never DOM images.
+                    let result;
+                    try {
+                        result = await network(tab.id, 'bootstrap');
+                    }
+                    catch (error) {
+                        if (live.status === 'complete')
+                            throw error;
+                    }
+                    if (result?.available && result.page) {
+                        // X may redirect to /i/history and finish its request before the
+                        // selected bookmark tab is mounted. Wait for the scope to settle.
+                        if (url === ORIGIN + '/i/history' && !String(JSON.parse(result.scope)[1] ?? '').trim()) {
+                            await new Promise(resolve => setTimeout(resolve, 250));
+                            continue;
+                        }
+                        assertBookmarkScope(url, result.scope);
+                        await this.captures;
+                        await this.check(identity.storeId, identity.scope);
+                        const saved = (await chrome.storage.session.get(DIRECT_KEY + identity.storeId))[DIRECT_KEY + identity.storeId];
+                        if (saved?.scope === identity.scope && saved.route && validRoute(saved.route) && saved.authorization) {
+                            await chrome.storage.session.set({ [BOOTSTRAP_READY_KEY + identity.storeId]: identity.scope });
+                            return result.page;
+                        }
+                    }
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            throw new Error('初回のブックマーク通信を30秒以内に確認できませんでした。');
+        }
+        finally {
+            // Also close on timeout, logout, parsing error and failed initialization.
+            try {
+                await chrome.tabs.remove(tab.id);
+            }
+            catch {
+                let exists = true;
+                try {
+                    await chrome.tabs.get(tab.id);
+                }
+                catch {
+                    exists = false;
+                }
+                if (exists)
+                    throw new Error('初回取得用タブを閉じられませんでした。');
+            }
+            await chrome.storage.session.remove(BOOTSTRAP_TAB_KEY);
+        }
     }
     async prepare(tabId) {
+        await this.recovery;
+        await this.cleanupBootstrap();
         const storeId = await this.cookieStore(tabId);
         const identity = await this.identity(storeId);
         // fetch() uses this extension context's default cookie store. Never cross
@@ -142,7 +233,20 @@ export class DirectBookmarks {
         const expected = chrome.extension.inIncognitoContext ? '1' : '0';
         if (storeId !== expected)
             throw new Error('このブラウザー領域では直接取得を実行できません。通常のウィンドウで実行してください。');
-        await this.template(identity);
+        try {
+            // Verify the first real response before reporting that saving has started.
+            this.initialPages.set(identity.scope, await this.fetchPage(storeId, identity.scope));
+        }
+        catch (error) {
+            await this.check(storeId, identity.scope);
+            const message = error instanceof Error ? error.message : String(error);
+            if (/HTTP 429|ログイン/.test(message))
+                throw error;
+            const readyKey = BOOTSTRAP_READY_KEY + storeId;
+            if ((await chrome.storage.session.get(readyKey))[readyKey] === identity.scope)
+                throw error;
+            this.initialPages.set(identity.scope, await this.bootstrap(identity, tabId));
+        }
         return { storeId, scope: identity.scope };
     }
     async check(storeId, expectedScope) {
@@ -150,6 +254,15 @@ export class DirectBookmarks {
             throw new Error('Xのログイン・アカウントが変わりました。元のアカウントで再開してください。');
     }
     async page(storeId, expectedScope, cursor) {
+        await this.check(storeId, expectedScope);
+        if (!cursor && this.initialPages.has(expectedScope)) {
+            const page = this.initialPages.get(expectedScope);
+            this.initialPages.delete(expectedScope);
+            return page;
+        }
+        return this.fetchPage(storeId, expectedScope, cursor);
+    }
+    async fetchPage(storeId, expectedScope, cursor) {
         const identity = await this.identity(storeId);
         if (identity.scope !== expectedScope)
             throw new Error('Xのログイン・アカウントが変わりました。取得位置を保持して停止します。');

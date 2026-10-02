@@ -42,7 +42,7 @@ function harness(initial = {}) {
       remove: async keys => { for (const k of Array.isArray(keys) ? keys : [keys]) delete store[k]; },
     } },
     downloads: {
-      download: async options => { calls.push(options); const id = nextId++; states.set(id, { id, state: 'complete', exists: true, mime: 'image/jpeg', url: options.url, finalUrl: options.url, startTime: new Date().toISOString() }); return id; },
+      download: async options => { calls.push(options); const id = nextId++; states.set(id, { id, state: 'complete', exists: true, mime: options.url.startsWith('https://video.twimg.com/') ? 'video/mp4' : 'image/jpeg', url: options.url, finalUrl: options.url, startTime: new Date().toISOString() }); return id; },
       search: async query => [...states.values()].filter(item => query.id != null ? item.id === query.id : (!query.url || query.url === item.url) && (!query.urlRegex || new RegExp(query.urlRegex).test(item.url)) && (!query.startedAfter || item.startTime >= query.startedAfter)),
       cancel: async id => { states.get(id).state = 'interrupted'; states.get(id).error = 'USER_CANCELED'; },
     },
@@ -70,5 +70,24 @@ function page(ids = [], cursor) {
   if (cursor) entries.push({ entryId: 'cursor-bottom', content: { cursorType: 'Bottom', value: cursor } });
   return { data: { bookmark_timeline_v2: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries }] } } } };
 }
-module.exports = { harness, page, flush };
+function nativeBootstrap(h, data = page(['BOOTSTRAP'])) {
+  h.chrome.cookies.getAllCookieStores = async () => [{ id: '0', tabIds: [1, 2, 3, 4] }];
+  h.backgroundSnap.pageUrl = 'https://x.com/i/bookmarks';
+  h.backgroundSnap.scope = JSON.stringify([h.backgroundSnap.pageUrl, '', 'account']);
+  const create = h.chrome.tabs.create;
+  h.chrome.tabs.create = async options => {
+    const tab = await create(options);
+    h.observe({ method: 'GET', tabId: tab.id, url: 'https://x.com/i/api/graphql/NATIVE_BOOTSTRAP/Bookmarks?variables=%7B%22count%22%3A20%7D&features=%7B%7D', requestHeaders: [{ name: 'authorization', value: 'Bearer native-bootstrap' }, { name: 'x-csrf-token', value: 'csrf-test' }] });
+    return tab;
+  };
+  const inject = h.chrome.scripting.executeScript;
+  h.chrome.scripting.executeScript = async options => {
+    if (options.world === 'MAIN' && options.args?.[0] === 'bootstrap') {
+      h.injections.push(options);
+      return [{ result: { available: true, scope: h.backgroundSnap.scope, documentId: 2, data } }];
+    }
+    return inject(options);
+  };
+}
+module.exports = { harness, page, flush, nativeBootstrap };
 

@@ -1,4 +1,4 @@
-import { parseMediaUrl, isXPage } from './media.js';
+import { parseMediaUrl, isXPage, tweetMedia } from './media.js';
 import { parseBookmarkPage } from './bookmarks.js';
 export function assertBookmarkScope(pageUrl, scope) {
     let valid = false;
@@ -55,6 +55,8 @@ export async function snapshot(tabId, current = false, targetPostId) {
                 }
                 if (article.querySelector('[data-testid="sensitiveMediaInterstitial"]'))
                     issues.push(`投稿 ${postId(article) || '不明'}: 非表示の画像があります。`);
+                if (article.querySelector('[data-testid="videoPlayer"], video'))
+                    issues.push(`投稿 ${postId(article) || '不明'}: 動画の全データを確認できません。`);
             }
             return { pageUrl: location.href, scope, documentId: performance.timeOrigin, urls: [...urls], posts: articles.map(postId), issues, excludedPosts: unconfirmed.length,
                 loading: !!root.querySelector('[role="progressbar"]'), y: window.scrollY,
@@ -91,6 +93,13 @@ export async function snapshot(tabId, current = false, targetPostId) {
             }
             else
                 result.issues.push(`投稿 ${id}: 全画像の一覧を確認できません。表示された画像のみの保存になる可能性があります。`);
+            for (const video of record?.videos ?? []) {
+                const parsed = tweetMedia(video);
+                if (parsed.media)
+                    (result.media ?? (result.media = [])).push(parsed.media);
+                if (parsed.issue)
+                    result.issues.push(`投稿 ${id}: ${parsed.issue}`);
+            }
         }
         result.urls = [...new Set(result.urls)];
     }
@@ -126,5 +135,5 @@ export function domPage(value) {
             issues.push(`未対応の画像URL: ${url}`);
         return parsed ? [parsed] : [];
     });
-    return { media, ended: false, issues, posts: value.posts.length, verifiedPostIds: value.verifiedPostIds ?? [] };
+    return { media: [...media, ...(value.media ?? [])], ended: false, issues, posts: value.posts.length, verifiedPostIds: value.verifiedPostIds ?? [] };
 }

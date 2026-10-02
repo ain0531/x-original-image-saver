@@ -1,14 +1,18 @@
-import { Media, errorText, isOriginalDownload, isXPage } from './media.js';
+import { Media, errorText, isMediaDownload, isXPage, mediaKey } from './media.js';
 import { ImageHistory } from './history.js';
 import { snapshot, network, domPage, assertBookmarkScope } from './sources.js';
 import { directBookmarks } from './direct-bookmarks.js';
 import { DEFAULT_OPTIONS, getOptions, downloadFileName } from './preferences.js';
 export type Settings = { scrollRatio: number; waitMsPerRound: number; stableRoundsNeeded: number; maxRounds: number; maxElapsedMs: number };
-export type Task = { media: Media; state: 'pending' | 'starting' | 'downloading' | 'saved' | 'skipped' | 'failed'; downloadId?: number; startedAt?: number; error?: string };
+export type Task = { media: Media; state: 'pending' | 'starting' | 'downloading' | 'saved' | 'skipped' | 'canceled' | 'failed'; downloadId?: number; startedAt?: number; error?: string };
 export type Job = { id: string; tabId: number; url: string; scope: string; documentId: number; source: 'direct' | 'network' | 'loaded' | 'current'; status: 'running' | 'paused' | 'done' | 'review'; cursor?: string; rounds: number; sourceDone: boolean; endedBy: string; issues: string[]; skip: boolean; settings: Settings; domCheckpoint?: string; stable: number; folder?: string; fileName?: string; postId?: string; saveAs?: boolean; background?: boolean; cookieStoreId?: string };
 const JOB_KEY = 'imageSaveJob';
 const TASK_PREFIX = 'imageSaveTask:';
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+// Match only explicit user cancellation, never shutdown, timeout or network errors.
+function userCanceled(message: string | undefined): boolean {
+  return typeof message === 'string' && /^(?:Error:\s*)*(USER_CANCELED|User cancel(?:ed|led))\.?$/i.test(message.trim());
+}
 export function settings(raw: any): Settings {
   const positive = (n: unknown, fallback: number, max: number) => typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.min(n, max) : fallback;
   return { scrollRatio: positive(raw?.scrollRatio, .8, 1), waitMsPerRound: positive(raw?.waitMsPerRound, 700, 10000), stableRoundsNeeded: Math.floor(positive(raw?.stableRoundsNeeded, 3, 100)), maxRounds: Math.floor(positive(raw?.maxRounds, 20, 1000)), maxElapsedMs: positive(raw?.maxElapsedMs, 30000, 300000) };
@@ -25,7 +29,18 @@ export class SaveJobs {
     if (!this.initialized) this.initialized = (async () => {
       const stored = await chrome.storage.local.get(null);
       this.job = stored[JOB_KEY] as Job | undefined;
-      if (this.job) for (const [key, task] of Object.entries(stored)) if (key.startsWith(TASK_PREFIX + this.job.id + ':')) this.tasks.set((task as Task).media.mediaId, task as Task);
+      if (this.job) for (const [key, task] of Object.entries(stored)) if (key.startsWith(TASK_PREFIX + this.job.id + ':')) this.tasks.set(mediaKey((task as Task).media), task as Task);
+      // Release cancellations left as failures by older versions without touching saved history.
+      if (this.job?.source === 'current') {
+        let changed = false;
+        for (const task of this.tasks.values()) if (task.state === 'failed' && userCanceled(task.error)) {
+          task.state = 'canceled'; task.error = undefined; task.downloadId = undefined;
+          await this.taskWrite(task); changed = true;
+        }
+        if (changed && this.job.sourceDone && !this.job.issues.length && [...this.tasks.values()].every(task => ['saved', 'skipped', 'canceled'].includes(task.state))) {
+          this.job.status = 'done'; await this.persist();
+        }
+      }
     })().catch(error => { this.initialized = undefined; throw error; });
     await this.initialized;
   }
@@ -35,14 +50,15 @@ export class SaveJobs {
     return write;
   }
   private key(id: string): string { return TASK_PREFIX + this.job!.id + ':' + id; }
-  private async taskWrite(task: Task): Promise<void> { await chrome.storage.local.set({ [this.key(task.media.mediaId)]: task }); }
+  private async taskWrite(task: Task): Promise<void> { await chrome.storage.local.set({ [this.key(mediaKey(task.media))]: task }); }
   async status(): Promise<any> {
     await this.init();
-    const stats = { total: this.tasks.size, success: 0, skipped: 0, failed: 0, pending: 0 };
+    const stats = { total: this.tasks.size, success: 0, skipped: 0, canceled: 0, failed: 0, pending: 0 };
     const failures: string[] = [];
     for (const task of this.tasks.values()) {
       if (task.state === 'saved') stats.success++;
       else if (task.state === 'skipped') stats.skipped++;
+      else if (task.state === 'canceled') stats.canceled++;
       else if (task.state === 'failed') { stats.failed++; failures.push(`${task.media.mediaId}: ${task.error}`); }
       else stats.pending++;
     }
@@ -94,18 +110,18 @@ export class SaveJobs {
     if (!current) assertBookmarkScope(snap.pageUrl, snap.scope);
     if (current && snap.pageUrl !== tab.url) throw new Error('ページが変わりました。もう一度開始してください。');
     // Never drop unfinished work when starting from a new head/current position.
-    const pending = [...this.tasks.values()].filter(task => !['saved', 'skipped'].includes(task.state));
+    const pending = [...this.tasks.values()].filter(task => !['saved', 'skipped', 'canceled'].includes(task.state));
     if (!current && this.job?.source === 'current' && pending.length) throw new Error('個別保存の未処理画像があります。先にその保存処理を再開して完了してください。');
     if (this.job && this.job.scope !== snap.scope && pending.length) throw new Error('別の対象に未処理画像があります。元のページで再開して保存を終えてください。');
     const stored = await chrome.storage.local.get(null);
     const oldKeys = Object.keys(stored).filter(key => key.startsWith(TASK_PREFIX));
     const job: Job = { id: String(Date.now()) + '-' + Math.random().toString(36).slice(2), tabId, url: snap.pageUrl, scope: snap.scope, documentId: snap.documentId, background: !current, cookieStoreId: target?.storeId,
-      source: current ? 'current' : 'direct', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: true, settings: settings(message.scrollSettings ?? { maxRounds: preferences.maxPages, maxElapsedMs: preferences.maxSeconds * 1000 }), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: current };
+      source: current ? 'current' : 'direct', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: true, settings: settings(message.scrollSettings ?? { maxRounds: preferences.maxPages, maxElapsedMs: preferences.maxSeconds * 1000 }), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: current && message.saveAs === true };
     // Save the new job and carried queue before removing the old queue.
     const carried: Record<string, unknown> = { [JOB_KEY]: job };
-    for (const task of pending) carried[TASK_PREFIX + job.id + ':' + task.media.mediaId] = { ...task, state: task.state === 'failed' ? (task.downloadId ? 'downloading' : 'pending') : task.state, error: undefined };
+    for (const task of pending) carried[TASK_PREFIX + job.id + ':' + mediaKey(task.media)] = { ...task, state: task.state === 'failed' ? (task.downloadId ? 'downloading' : 'pending') : task.state, error: undefined };
     await chrome.storage.local.set(carried);
-    this.job = job; this.tasks = new Map(pending.map(task => [task.media.mediaId, carried[TASK_PREFIX + job.id + ':' + task.media.mediaId] as Task]));
+    this.job = job; this.tasks = new Map(pending.map(task => [mediaKey(task.media), carried[TASK_PREFIX + job.id + ':' + mediaKey(task.media)] as Task]));
     if (oldKeys.length) await chrome.storage.local.remove(oldKeys);
     // Native bookmark responses are authoritative; do not mix visible recommendations in.
     if (current) await this.enqueue(domPage(snap));
@@ -114,15 +130,15 @@ export class SaveJobs {
     this.kick(); return this.status();
   }
   private async enqueue(page: { media: Media[]; issues: string[]; verifiedPostIds?: string[] }): Promise<void> {
-    const additions = page.media.filter(media => !this.tasks.has(media.mediaId));
+    const additions = page.media.filter(media => !this.tasks.has(mediaKey(media)));
     const confirmed = this.job!.skip ? await this.history.confirmedMany(additions) : new Map();
     const rows: Record<string, Task> = {};
     for (const media of additions) {
-      const task: Task = { media, state: confirmed.get(media.mediaId) != null ? 'skipped' : 'pending' };
-      rows[this.key(media.mediaId)] = task;
+      const task: Task = { media, state: confirmed.get(mediaKey(media)) != null ? 'skipped' : 'pending' };
+      rows[this.key(mediaKey(media))] = task;
     }
     if (Object.keys(rows).length) await chrome.storage.local.set(rows);
-    for (const task of Object.values(rows)) this.tasks.set(task.media.mediaId, task);
+    for (const task of Object.values(rows)) this.tasks.set(mediaKey(task.media), task);
     this.job!.issues = this.job!.issues.filter(issue => !(page.verifiedPostIds ?? []).some(id => issue.startsWith(`投稿 ${id}:`) && /全画像|読み込まれていない画像|非表示の画像/.test(issue)));
     for (const issue of page.issues) if (!this.job!.issues.includes(issue)) this.job!.issues.push(issue);
     await this.persist();
@@ -143,12 +159,12 @@ export class SaveJobs {
     let collecting = true;
     const workers = Array.from({ length: job.source === 'current' ? 1 : 4 }, () => (async () => {
       while (job.status === 'running') {
-        const task = [...this.tasks.values()].find(task => ['pending', 'starting', 'downloading'].includes(task.state) && !active.has(task.media.mediaId));
+        const task = [...this.tasks.values()].find(task => ['pending', 'starting', 'downloading'].includes(task.state) && !active.has(mediaKey(task.media)));
         if (!task) { if (!collecting) break; await delay(100); continue; }
-        active.add(task.media.mediaId);
+        active.add(mediaKey(task.media));
         try { await this.transfer(task); }
         catch (error) { job.status = 'paused'; job.endedBy = errorText(error); }
-        finally { active.delete(task.media.mediaId); }
+        finally { active.delete(mediaKey(task.media)); }
       }
     })());
     const startedAt = Date.now();
@@ -201,7 +217,7 @@ export class SaveJobs {
   private async transfer(task: Task): Promise<void> {
     if (!task.downloadId && ['pending', 'starting'].includes(task.state) && this.job!.skip) {
       const confirmed = await this.history.confirmedMany([task.media]);
-      if (confirmed.get(task.media.mediaId) != null) { task.state = 'skipped'; await this.taskWrite(task); return; }
+      if (confirmed.get(mediaKey(task.media)) != null) { task.state = 'skipped'; await this.taskWrite(task); return; }
     }
     if (task.state === 'starting' && !task.downloadId) {
       // Recover the small download()/persist gap only when exactly one match is proven.
@@ -211,18 +227,25 @@ export class SaveJobs {
     if (!task.downloadId) {
       task.state = 'starting'; task.startedAt = Date.now(); await this.taskWrite(task);
       try { task.downloadId = await chrome.downloads.download({ url: task.media.origUrl, filename: downloadFileName(task.media, { folder: this.job!.folder ?? '', fileName: this.job!.fileName ?? DEFAULT_OPTIONS.fileName }), conflictAction: 'uniquify', saveAs: this.job!.saveAs ?? this.job!.source === 'current' }); }
-      catch (error) { task.state = 'failed'; task.error = errorText(error); await this.taskWrite(task); return; }
+      catch (error) {
+        const message = errorText(error);
+        task.state = this.job!.source === 'current' && userCanceled(message) ? 'canceled' : 'failed';
+        task.error = task.state === 'canceled' ? undefined : message;
+        await this.taskWrite(task); return;
+      }
       task.state = 'downloading'; await this.taskWrite(task);
     }
-    const deadline = Date.now() + 120000;
+    const deadline = Date.now() + (task.media.kind === 'video' ? 600000 : 120000);
     while (true) {
       // A monitoring failure retains the ID, rather than starting a second transfer.
       const [item] = await chrome.downloads.search({ id: task.downloadId });
       if (!item || item.state === 'interrupted') {
-        task.state = 'failed'; task.error = item?.error ?? 'ダウンロードの状態を確認できません。'; task.downloadId = undefined; await this.taskWrite(task); return;
+        task.state = this.job!.source === 'current' && userCanceled(item?.error) ? 'canceled' : 'failed';
+        task.error = task.state === 'canceled' ? undefined : item?.error ?? 'ダウンロードの状態を確認できません。';
+        task.downloadId = undefined; await this.taskWrite(task); return;
       }
       if (item.state === 'complete') {
-        if (!isOriginalDownload(item, task.media.mediaId)) { task.state = 'failed'; task.error = '原寸画像・ファイル存在・画像形式を確認できません。'; task.downloadId = undefined; await this.taskWrite(task); return; }
+        if (!isMediaDownload(item, task.media)) { task.state = 'failed'; task.error = '保存ファイルの形式・URL・存在を確認できません。'; task.downloadId = undefined; await this.taskWrite(task); return; }
         // History write failure keeps the complete ID, so retry only the record.
         await this.history.record(task.media, task.downloadId!);
         task.state = 'saved'; task.error = undefined; await this.taskWrite(task); return;
@@ -232,7 +255,7 @@ export class SaveJobs {
         const [after] = await chrome.downloads.search({ id: task.downloadId });
         if (after?.state === 'complete') continue;
         if (after?.state !== 'interrupted') throw new Error('転送の停止を確認できません。ダウンロードIDを保持しました。');
-        task.state = 'failed'; task.error = '原寸画像の転送が時間切れになりました。'; task.downloadId = undefined; await this.taskWrite(task); return;
+        task.state = 'failed'; task.error = 'ファイルの転送が時間切れになりました。'; task.downloadId = undefined; await this.taskWrite(task); return;
       }
       await delay(1000);
     }

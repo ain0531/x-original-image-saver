@@ -26,7 +26,7 @@ function harness({ get, sendMessage } = {}) {
   const messages = [];
   const document = { getElementById: id => {
     if (!elements.has(id)) elements.set(id, {
-      value: '', checked: true, disabled: false, textContent: '',
+      value: '', checked: id !== 'specify-save-location', disabled: false, textContent: '',
       addEventListener: (_, listener) => { elements.get(id).click = listener; },
     });
     return elements.get(id);
@@ -91,4 +91,21 @@ test('side panel opens the registered options page', async () => {
   h.elements.get('open-options').click(); await flush(); assert.equal(opened, true);
   const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
   assert.equal(manifest.options_ui.page, 'options.html'); assert.equal(manifest.options_ui.open_in_tab, true);
+});
+
+test('save location checkbox defaults off and toggles only individual Save As requests', async () => {
+  const html = fs.readFileSync('sidepanel.html', 'utf8');
+  const input = html.match(/<input\b[^>]*id="specify-save-location"[^>]*>/)?.[0];
+  assert.ok(input); assert.ok(!/\bchecked\b/.test(input));
+  assert.ok(html.indexOf('id="save-current-tweet"') < html.indexOf('id="specify-save-location"'));
+  const h = harness(); await flush();
+  const checkbox = h.elements.get('specify-save-location');
+  assert.equal(checkbox.checked, false);
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(h.messages[0].saveAs, false);
+  checkbox.checked = true;
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(h.messages[1].saveAs, true);
+  h.elements.get('save-all-visible').click(); await flush();
+  assert.equal(h.messages[2].saveAs, false);
 });

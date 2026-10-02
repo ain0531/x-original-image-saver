@@ -34,17 +34,17 @@ test('client metadata extraction uses current feature values and rejects unknown
   assert.throws(() => h.context.clientBookmarkConfig(config, {}), /取得設定/);
   assert.equal(h.context.clientBookmarkConfig(config.replace('Bookmarks', 'Likes'), { known_feature: false }), undefined);
 });
-test('401, malformed responses and account changes never fall back to page images', async () => {
-  for (const mode of ['http', 'body', 'account']) {
+test('rate limits and account changes stop initial preparation without a tab or page-image fallback', async () => {
+  for (const mode of ['http', 'account']) {
     const h = harness(); h.snap.urls = [url('DOM_ONLY')]; const fetch = h.context.fetch;
     h.context.fetch = async (raw, init) => {
       if (!raw.includes('/graphql/')) return fetch(raw, init);
-      if (mode === 'http') return { ok: false, status: 401 };
+      if (mode === 'http') return { ok: false, status: 429 };
       if (mode === 'account') h.auth = 'other-account';
-      return { ok: true, json: async () => mode === 'body' ? { data: { home: {} } } : page(['A']) };
+      return { ok: true, json: async () => page(['A']) };
     };
-    assert.equal((await start(h)).ok, true); const result = await h.done();
-    assert.equal(result.job.status, 'paused'); assert.equal(h.calls.length, 0); assert.equal(h.createdTabs.length, 0);
+    assert.equal((await start(h)).ok, false);
+    assert.equal(h.calls.length, 0); assert.equal(h.createdTabs.length, 0);
     assert.equal(h.injections.length, 0);
   }
 });

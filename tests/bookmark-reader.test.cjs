@@ -7,7 +7,7 @@ function readerHarness() {
   let account = '';
   const requests = []; let responseBody = { data: { test: true } };
   class XHR {
-    open() {} setRequestHeader() {} send() {} addEventListener() {}
+    open() {} setRequestHeader() {} send() {} addEventListener(type, callback) { if (type === 'load') this.load = callback; }
   }
   const root = { querySelector: () => selected ? { textContent: selected } : null };
   const document = { querySelector: selector => selector.includes('AccountSwitcher') ? (account ? { textContent: account } : null) : root };
@@ -19,6 +19,28 @@ function readerHarness() {
   return { window, requests, context, set body(value) { responseBody = value; }, set selected(value) { selected = value; }, set account(value) { account = value; } };
 }
 const nativeUrl = 'https://x.com/i/api/graphql/NATIVE_ID/Bookmarks?variables=' + encodeURIComponent(JSON.stringify({ count: 20, cursor: 'old', includePromotedContent: false })) + '&features=%7B%22native%22%3Atrue%7D';
+test('bootstrap returns only native first-page bookmarks without another fetch or credentials', async () => {
+  const h = readerHarness(); h.selected = 'ブックマーク'; h.account = 'user';
+  await h.window.fetch(nativeUrl);
+  assert.equal((await h.window.__xImageBookmarkReader('bootstrap')).available, false);
+  const first = new URL(nativeUrl); first.searchParams.set('variables', '{"count":20}');
+  h.body = { data: { bookmark_timeline_v2: { timeline: { instructions: [] } } } };
+  await h.window.fetch(first.toString(), { headers: { authorization: 'private-token' } });
+  const result = await h.window.__xImageBookmarkReader('bootstrap');
+  assert.equal(result.available, true); assert.ok(result.data.data.bookmark_timeline_v2);
+  assert.equal(h.requests.length, 2); assert.ok(!JSON.stringify(result).includes('private-token'));
+  h.account = 'other'; assert.equal((await h.window.__xImageBookmarkReader('bootstrap')).available, false);
+});
+test('native XHR first-page response can initialize bookmarks without another request', async () => {
+  const h = readerHarness(); h.selected = 'ブックマーク'; h.account = 'user';
+  const first = new URL(nativeUrl); first.searchParams.set('variables', '{"count":20}');
+  const xhr = new h.context.XMLHttpRequest(); xhr.status = 200; xhr.responseType = 'json';
+  xhr.response = { data: { bookmark_timeline_v2: { timeline: { instructions: [] } } } };
+  xhr.open('GET', first.toString()); xhr.setRequestHeader('authorization', 'private-xhr'); xhr.send(); xhr.load();
+  const result = await h.window.__xImageBookmarkReader('bootstrap');
+  assert.equal(result.available, true); assert.ok(result.data.data.bookmark_timeline_v2);
+  assert.equal(h.requests.length, 0); assert.ok(!JSON.stringify(result).includes('private-xhr'));
+});
 test('MAIN capture reuses native request credentials and cursor without exposing them', async () => {
   const h = readerHarness();
   assert.equal((await h.window.__xImageBookmarkReader('probe')).available, false);
@@ -67,4 +89,13 @@ test('native responses keep every photo even when only one is rendered', async (
   h.account = 'other';
   const changed = JSON.stringify(['https://x.com/i/history', 'ブックマーク', 'other']);
   assert.equal((await h.window.__xImageBookmarkReader('posts', undefined, changed, ['101'])).posts.length, 0);
+});
+test('native responses retain complete video variant metadata without treating the poster as a photo', async () => {
+  const h = readerHarness(); h.selected = 'ブックマーク'; h.account = 'user';
+  const video = { type: 'video', id_str: '123', media_key: '13_123', media_url_https: 'https://pbs.twimg.com/media/POSTER.jpg', video_info: { variants: [{ bitrate: 2176000, content_type: 'video/mp4', url: 'https://video.twimg.com/ext_tw_video/123/pu/vid/1280x720/test.mp4' }] } };
+  h.body = { data: { result: { rest_id: '101', legacy: { full_text: 'post', extended_entities: { media: [video] } } } } };
+  await h.window.fetch(nativeUrl.replace('/Bookmarks?', '/TweetDetail?'));
+  const scope = JSON.stringify(['https://x.com/i/history', 'ブックマーク', 'user']);
+  const result = await h.window.__xImageBookmarkReader('posts', undefined, scope, ['101']);
+  assert.equal(result.posts[0].urls.length, 0); assert.equal(result.posts[0].videos.length, 1); assert.equal(result.posts[0].videos[0].video_info.variants[0].bitrate, 2176000);
 });

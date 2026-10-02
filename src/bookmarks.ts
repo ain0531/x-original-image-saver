@@ -1,4 +1,4 @@
-import { Media, parseMediaUrl } from './media.js';
+import { Media, tweetMedia, mediaKey } from './media.js';
 export type BookmarkPage = { media: Media[]; cursor?: string; ended: boolean; issues: string[]; posts: number; verifiedPostIds: string[] };
 export function parseBookmarkPage(body: any): BookmarkPage {
   if (body?.errors?.length) throw new Error('Xが投稿データ取得エラーを返しました。取得位置は保持しています。');
@@ -27,13 +27,11 @@ export function parseBookmarkPage(body: any): BookmarkPage {
     const full = [result.legacy.extended_entities?.media, result.legacy.extended_tweet?.extended_entities?.media].filter(Array.isArray);
     const list = full.length ? full.flat() : result.legacy.entities?.media ?? [];
     if (full.length || !list.length) verifiedPostIds.push(id);
-    if (!full.length && list.some((item: any) => item.type === 'photo')) issues.push(`投稿 ${id}: 全画像の一覧がなく、複数枚の確認ができません。`);
+    if (!full.length && list.length) issues.push(`投稿 ${id}: 全画像・動画の一覧がなく、複数ファイルの確認ができません。`);
     for (const item of list) {
-      if (item.type === 'video' || item.type === 'animated_gif') continue;
-      if (item.type !== 'photo') { issues.push(`投稿 ${id}: 未対応のメディア種別。`); continue; }
-      const parsed = parseMediaUrl(item.media_url_https ?? item.media_url ?? '');
-      if (parsed) media.set(parsed.mediaId, parsed);
-      else issues.push(`投稿 ${id}: 画像URLを認識できません。`);
+      const parsed = tweetMedia(item);
+      if (parsed.media) media.set(mediaKey(parsed.media), parsed.media);
+      if (parsed.issue) issues.push(`投稿 ${id}: ${parsed.issue}`);
     }
     if (!quoted && result.quoted_status_result?.result) tweet(result.quoted_status_result.result, true);
     if (result.legacy.quoted_status_id_str && !result.quoted_status_result?.result) issues.push(`投稿 ${id}: 引用投稿の画像を確認できません。`);
