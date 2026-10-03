@@ -117,14 +117,17 @@ export class DirectAccountMedia {
     const pendingScripts: string[] = [];
     for (let offset = 0; offset < Math.min(assets.length, 64) && Date.now() < discoveryDeadline; offset += 4) {
       const scripts = await Promise.allSettled(assets.slice(offset, offset + 4).map(async asset => (await this.request(asset, { credentials: 'omit', redirect: 'error' }, Math.max(1, discoveryDeadline - Date.now()))).text()));
+      const scannedBefore = pendingScripts.length;
+      let learned = false;
       for (const script of scripts) {
         scanned++;
         if (script.status === 'rejected') { configurationError = script.reason; continue; }
         pendingScripts.push(script.value);
-        for (const [name, value] of Object.entries(featureValues(script.value))) if (!(name in values)) values[name] = value;
+        for (const [name, value] of Object.entries(featureValues(script.value))) if (!(name in values)) { values[name] = value; learned = true; }
       }
-      // Definitions may be in a later chunk than the operation metadata.
-      for (const js of pendingScripts) {
+      // Definitions may be in a later chunk than the operation metadata. Earlier
+      // chunks can only resolve differently once new feature values were learned.
+      for (const js of learned ? pendingScripts : pendingScripts.slice(scannedBefore)) {
       const token = /["'](AAAAAAA[A-Za-z0-9%_-]{30,})["']/.exec(js)?.[1];
       if (token) result.authorization = `Bearer ${token}`;
       for (const operation of ['UserMedia', 'UserByScreenName'] as const) {
@@ -297,13 +300,12 @@ export class DirectAccountMedia {
     await directBookmarks.check(storeId, JSON.stringify([ACCOUNT_ORIGIN + '/i/bookmarks', 'Bookmarks', login]));
   }
   async page(storeId: string, scope: string, cursor?: string): Promise<BookmarkPage> {
-    await this.check(storeId, scope);
-    if (!cursor && this.initialPages.has(scope)) { const page = this.initialPages.get(scope)!; this.initialPages.delete(scope); return page; }
+    if (!cursor && this.initialPages.has(scope)) { await this.check(storeId, scope); const page = this.initialPages.get(scope)!; this.initialPages.delete(scope); return page; }
     return this.fetchPage(storeId, scope, undefined, cursor);
   }
   private async fetchPage(storeId: string, scope: string, supplied?: AccountTemplate, cursor?: string): Promise<BookmarkPage> {
-    await this.check(storeId, scope);
-    const [url, , login, userId, mediaType] = JSON.parse(scope); const target = accountMediaTarget(url);
+    // query() verifies the login before and after the request.
+    const [url, , login, userId, mediaType] = JSON.parse(scope); assertAccountMediaScope(url, scope); const target = accountMediaTarget(url);
     if (mediaType) target.mediaType = mediaType;
     const loginScope = JSON.stringify([ACCOUNT_ORIGIN + '/i/bookmarks', 'Bookmarks', login]);
     const template = supplied ?? await this.template(storeId, loginScope, target, false);

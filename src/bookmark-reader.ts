@@ -38,7 +38,9 @@
     return a[2] ? a[2] === b[2] : a[0] === b[0];
   };
   const remember = (body: unknown, requestScope: string, onlyId?: string, rendered = false) => {
-    if (!compatible(requestScope, scope())) return;
+    // Traversal is synchronous, so one DOM read of the scope serves every post.
+    const currentScope = scope();
+    if (!compatible(requestScope, currentScope)) return;
     let nodes = 0;
     const seen = new WeakSet<object>();
     const visit = (value: any, depth: number) => {
@@ -67,8 +69,8 @@
         const complete = valid && (full.length > 0 || !(legacy.entities?.media?.length));
         const old = postImages.get(id);
         // A truncated result must not replace a previously observed full list.
-        if (!old || !postCompatible(old.scope, scope()) || complete || !old.complete) {
-          postImages.delete(id); postImages.set(id, { postId: id, urls: [...urls], videos, complete, scope: scope(), at: Date.now() });
+        if (!old || !postCompatible(old.scope, currentScope) || complete || !old.complete) {
+          postImages.delete(id); postImages.set(id, { postId: id, urls: [...urls], videos, complete, scope: currentScope, at: Date.now() });
         }
         while (postImages.size > 2000) postImages.delete(postImages.keys().next().value!);
       }

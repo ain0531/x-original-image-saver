@@ -40,8 +40,8 @@ export class ImageHistory {
         if (!this.ready)
             this.ready = (async () => {
                 await this.migrate();
-                const stored = await chrome.storage.local.get(null);
-                if (stored[INDEXED])
+                // Read only the flag; saved ID records grow without limit.
+                if ((await chrome.storage.local.get(INDEXED))[INDEXED])
                     return;
                 // Import verifiable past original downloads once, even if Chrome's file
                 // has since moved. The durable image ID records are authoritative after that.
@@ -52,12 +52,13 @@ export class ImageHistory {
                 catch {
                     return;
                 } // Known ID records remain usable if Chrome history is unavailable.
-                const rows = {};
-                for (const item of items) {
+                const originals = items.flatMap(item => {
                     const media = parseMediaUrl(item.url);
-                    if (!media || !isOriginalDownload({ ...item, exists: true }, media.mediaId))
-                        continue;
-                    const key = HISTORY_PREFIX + media.mediaId;
+                    return media && isOriginalDownload({ ...item, exists: true }, media.mediaId) ? [{ item, key: HISTORY_PREFIX + media.mediaId }] : [];
+                });
+                const stored = originals.length ? await chrome.storage.local.get([...new Set(originals.map(row => row.key))]) : {};
+                const rows = {};
+                for (const { item, key } of originals) {
                     if (stored[key]?.quality === 'orig')
                         continue;
                     const date = Date.parse(item.startTime);
@@ -123,3 +124,5 @@ export class ImageHistory {
         return keys.length;
     }
 }
+// One instance per worker, so the one-time import check is not repeated per local save.
+export const sharedHistory = new ImageHistory();

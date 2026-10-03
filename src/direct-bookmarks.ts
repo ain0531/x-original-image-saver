@@ -44,6 +44,7 @@ export class DirectBookmarks {
   private captures: Promise<void> = Promise.resolve();
   private initialPages = new Map<string, BookmarkPage>();
   private recovery: Promise<void>;
+  private fingerprint?: { auth: string; value: string };
   constructor() {
     this.recovery = this.cleanupBootstrap().catch(() => {});
     chrome.webRequest.onBeforeSendHeaders.addListener(details => {
@@ -62,9 +63,12 @@ export class DirectBookmarks {
     const auth = cookies.find(cookie => cookie.name === 'auth_token')?.value;
     const csrf = cookies.find(cookie => cookie.name === 'ct0')?.value;
     if (!auth || !csrf) throw new Error('Xにログインしてから再試行してください。');
-    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(auth));
-    const fingerprint = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
-    return { storeId, csrf, scope: JSON.stringify([ORIGIN + '/i/bookmarks', 'Bookmarks', storeId + ':' + fingerprint]) };
+    // Cookies are read every time; only the hash of an unchanged token is reused.
+    if (this.fingerprint?.auth !== auth) {
+      const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(auth));
+      this.fingerprint = { auth, value: Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('') };
+    }
+    return { storeId, csrf, scope: JSON.stringify([ORIGIN + '/i/bookmarks', 'Bookmarks', storeId + ':' + this.fingerprint.value]) };
   }
   async login(tabId: number): Promise<DirectIdentity> {
     const storeId = await this.cookieStore(tabId);
@@ -93,18 +97,22 @@ export class DirectBookmarks {
     try { features = JSON.parse(url.searchParams.get('features') ?? '{}'); } catch { return; }
     features = Object.fromEntries(Object.entries(features).filter(([, value]) => typeof value === 'boolean'));
     const same = old?.scope === identity.scope;
-    await chrome.storage.session.set({ [key]: {
+    const next: DirectTemplate = {
       scope: identity.scope, authorization, at: Date.now(),
       route: validRoute(details.url) ? details.url : same ? old?.route : undefined,
       features: { ...(same ? old?.features : {}), ...features },
-    } satisfies DirectTemplate });
+    };
+    // X sends many GraphQL requests; skip unchanged writes, but keep the 1-hour freshness alive.
+    if (old && same && old.authorization === next.authorization && old.route === next.route && Date.now() - old.at < 300000 &&
+      Object.keys(next.features!).length === Object.keys(old.features ?? {}).length && Object.entries(next.features!).every(([name, value]) => old.features?.[name] === value)) return;
+    await chrome.storage.session.set({ [key]: next });
   }
   private async request(url: string, init: RequestInit = {}): Promise<Response> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
     try {
       const response = await fetch(url, { ...init, signal: controller.signal });
-      if (!response.ok) throw new Error(`ブックマークのデータ取得に失敗しました（HTTP ${response.status}）。`);
+      if (!response.ok) throw Object.assign(new Error(`ブックマークのデータ取得に失敗しました（HTTP ${response.status}）。`), { status: response.status });
       return response;
     } catch (error) {
       if (controller.signal.aborted) throw new Error('ブックマークの通信が時間切れになりました。取得位置は保持します。');
@@ -125,8 +133,11 @@ export class DirectBookmarks {
     const assets = [...new Set(Array.from(html.matchAll(/https:\/\/abs\.twimg\.com\/responsive-web\/[A-Za-z0-9_./-]+\.js/g), match => match[0]))];
     assets.sort((a, b) => Number(!a.includes('/main.')) - Number(!b.includes('/main.')));
     let authorization = old?.authorization;
-    for (const asset of assets.slice(0, 6)) {
-      const js = await (await this.request(asset, { credentials: 'omit', redirect: 'error' })).text();
+    // Fetch in parallel, but evaluate and fail in the original order.
+    const scripts = assets.slice(0, 6).map(asset => this.request(asset, { credentials: 'omit', redirect: 'error' }).then(response => response.text()));
+    for (const script of scripts) script.catch(() => {});
+    for (const script of scripts) {
+      const js = await script;
       const token = /["'](AAAAAAA[A-Za-z0-9%_-]{30,})["']/.exec(js)?.[1];
       if (token) authorization = `Bearer ${token}`;
       const config = clientBookmarkConfig(js, values);
@@ -227,8 +238,8 @@ export class DirectBookmarks {
     if ((await this.identity(storeId)).scope !== expectedScope) throw new Error('Xのログイン・アカウントが変わりました。元のアカウントで再開してください。');
   }
   async page(storeId: string, expectedScope: string, cursor?: string): Promise<BookmarkPage> {
-    await this.check(storeId, expectedScope);
     if (!cursor && this.initialPages.has(expectedScope)) {
+      await this.check(storeId, expectedScope);
       const page = this.initialPages.get(expectedScope)!;
       this.initialPages.delete(expectedScope);
       return page;
@@ -251,7 +262,10 @@ export class DirectBookmarks {
         'x-twitter-auth-type': 'OAuth2Session', 'x-twitter-active-user': 'yes',
       } });
     } catch (error) {
-      await chrome.storage.session.remove(DIRECT_KEY + storeId);
+      // Keep learned settings for rate limits, server errors, timeouts and network
+      // failures; only a rejected request means the operation or token is stale.
+      const status = (error as { status?: unknown })?.status;
+      if (typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429) await chrome.storage.session.remove(DIRECT_KEY + storeId);
       throw error;
     }
     try {

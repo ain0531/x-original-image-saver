@@ -15,6 +15,7 @@ function harness(initial = {}) {
   let backgroundAvailable = true;
   let networkAvailable = false;
   const pages = []; const cached = [];
+  const downloadListeners = [];
   const session = {}; const directRequests = []; let auth = 'logged-in-account'; let csrf = 'csrf-test'; const requestObservers = [];
   const chrome = {
     extension: { inIncognitoContext: false },
@@ -45,6 +46,7 @@ function harness(initial = {}) {
       download: async options => { calls.push(options); const id = nextId++; states.set(id, { id, state: 'complete', exists: true, mime: options.url.startsWith('https://video.twimg.com/') ? 'video/mp4' : 'image/jpeg', url: options.url, finalUrl: options.url, startTime: new Date().toISOString() }); return id; },
       search: async query => [...states.values()].filter(item => query.id != null ? item.id === query.id : (!query.url || query.url === item.url) && (!query.urlRegex || new RegExp(query.urlRegex).test(item.url)) && (!query.startedAfter || item.startTime >= query.startedAfter)),
       cancel: async id => { states.get(id).state = 'interrupted'; states.get(id).error = 'USER_CANCELED'; },
+      onChanged: { addListener: callback => downloadListeners.push(callback) },
     },
   };
   const fetch = async (raw, init) => {
@@ -60,7 +62,7 @@ function harness(initial = {}) {
     vm.runInContext(source, context, { filename: name });
   }
   const request = (message, sender = { id: 'test', url: 'chrome-extension://test/sidepanel.html' }) => new Promise(resolve => listener(message, sender, resolve));
-  return { context, chrome, calls, states, injections, snap, backgroundSnap, createdTabs, removedTabs, pages, cached, scope, directRequests, session, observe: details => requestObservers.forEach(observer => observer(details)), set auth(value) { auth = value; }, set csrf(value) { csrf = value; }, request, get store() { return store; }, set available(value) { networkAvailable = value; }, set backgroundAvailable(value) { backgroundAvailable = value; }, async done() {
+  return { context, chrome, calls, states, injections, snap, backgroundSnap, createdTabs, removedTabs, pages, cached, scope, directRequests, session, observe: details => requestObservers.forEach(observer => observer(details)), downloadChanged: id => downloadListeners.forEach(listener => listener({ id })), set auth(value) { auth = value; }, set csrf(value) { csrf = value; }, request, get store() { return store; }, set available(value) { networkAvailable = value; }, set backgroundAvailable(value) { backgroundAvailable = value; }, async done() {
     for (let n = 0; n < 200; n++) { await flush(); const status = await request({ type: 'GET_SAVE_STATUS' }); if (status.job?.status !== 'running' && !status.busy) return status; await new Promise(r => setTimeout(r, 5)); }
     throw new Error('Job did not finish');
   } };

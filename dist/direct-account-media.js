@@ -154,6 +154,8 @@ export class DirectAccountMedia {
         const pendingScripts = [];
         for (let offset = 0; offset < Math.min(assets.length, 64) && Date.now() < discoveryDeadline; offset += 4) {
             const scripts = await Promise.allSettled(assets.slice(offset, offset + 4).map(async (asset) => (await this.request(asset, { credentials: 'omit', redirect: 'error' }, Math.max(1, discoveryDeadline - Date.now()))).text()));
+            const scannedBefore = pendingScripts.length;
+            let learned = false;
             for (const script of scripts) {
                 scanned++;
                 if (script.status === 'rejected') {
@@ -162,11 +164,14 @@ export class DirectAccountMedia {
                 }
                 pendingScripts.push(script.value);
                 for (const [name, value] of Object.entries(featureValues(script.value)))
-                    if (!(name in values))
+                    if (!(name in values)) {
                         values[name] = value;
+                        learned = true;
+                    }
             }
-            // Definitions may be in a later chunk than the operation metadata.
-            for (const js of pendingScripts) {
+            // Definitions may be in a later chunk than the operation metadata. Earlier
+            // chunks can only resolve differently once new feature values were learned.
+            for (const js of learned ? pendingScripts : pendingScripts.slice(scannedBefore)) {
                 const token = /["'](AAAAAAA[A-Za-z0-9%_-]{30,})["']/.exec(js)?.[1];
                 if (token)
                     result.authorization = `Bearer ${token}`;
@@ -406,8 +411,8 @@ export class DirectAccountMedia {
         await directBookmarks.check(storeId, JSON.stringify([ACCOUNT_ORIGIN + '/i/bookmarks', 'Bookmarks', login]));
     }
     async page(storeId, scope, cursor) {
-        await this.check(storeId, scope);
         if (!cursor && this.initialPages.has(scope)) {
+            await this.check(storeId, scope);
             const page = this.initialPages.get(scope);
             this.initialPages.delete(scope);
             return page;
@@ -415,8 +420,9 @@ export class DirectAccountMedia {
         return this.fetchPage(storeId, scope, undefined, cursor);
     }
     async fetchPage(storeId, scope, supplied, cursor) {
-        await this.check(storeId, scope);
+        // query() verifies the login before and after the request.
         const [url, , login, userId, mediaType] = JSON.parse(scope);
+        assertAccountMediaScope(url, scope);
         const target = accountMediaTarget(url);
         if (mediaType)
             target.mediaType = mediaType;

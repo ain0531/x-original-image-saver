@@ -1,5 +1,5 @@
 import { errorText, isMediaDownload, isXPage, mediaKey } from './media.js';
-import { ImageHistory } from './history.js';
+import { sharedHistory } from './history.js';
 import { snapshot, network, domPage, assertBookmarkScope, likePost } from './sources.js';
 import { directBookmarks } from './direct-bookmarks.js';
 import { directAccountMedia, assertAccountMediaScope } from './direct-account-media.js';
@@ -7,6 +7,33 @@ import { DEFAULT_OPTIONS, getOptions, downloadFileName } from './preferences.js'
 const JOB_KEY = 'imageSaveJob';
 const TASK_PREFIX = 'imageSaveTask:';
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// Download changes wake the monitor at once; the timer remains the fallback
+// for missed events and worker restarts.
+const downloadWaiters = new Map();
+chrome.downloads.onChanged?.addListener(delta => {
+    const waiters = downloadWaiters.get(delta.id);
+    if (!waiters)
+        return;
+    downloadWaiters.delete(delta.id);
+    for (const wake of waiters)
+        wake();
+});
+function downloadChange(id, ms) {
+    let wake;
+    const wait = new Promise(resolve => { wake = resolve; });
+    const timer = setTimeout(() => wake(), ms);
+    const waiters = downloadWaiters.get(id) ?? new Set();
+    waiters.add(wake);
+    downloadWaiters.set(id, waiters);
+    const cancel = () => {
+        clearTimeout(timer);
+        waiters.delete(wake);
+        if (!waiters.size && downloadWaiters.get(id) === waiters)
+            downloadWaiters.delete(id);
+    };
+    void wait.then(cancel);
+    return { wait, cancel };
+}
 // Match only explicit user cancellation, never shutdown, timeout or network errors.
 function userCanceled(message) {
     return typeof message === 'string' && /^(?:Error:\s*)*(USER_CANCELED|User cancel(?:ed|led))\.?$/i.test(message.trim());
@@ -19,16 +46,28 @@ export class SaveJobs {
     constructor(jobKey = JOB_KEY, taskPrefix = TASK_PREFIX) {
         this.jobKey = jobKey;
         this.taskPrefix = taskPrefix;
-        this.history = new ImageHistory();
+        this.history = sharedHistory;
         this.tasks = new Map();
         this.writes = Promise.resolve();
         this.control = Promise.resolve();
+        // Wakes idle workers when tasks are added or finished, instead of waiting a full poll.
+        this.wakers = new Set();
+    }
+    signal() { const wakers = [...this.wakers]; this.wakers.clear(); for (const wake of wakers)
+        wake(); }
+    nap(ms) {
+        return new Promise(resolve => {
+            const wake = () => { clearTimeout(timer); this.wakers.delete(wake); resolve(); };
+            const timer = setTimeout(wake, ms);
+            this.wakers.add(wake);
+        });
     }
     async init() {
         if (!this.initialized)
             this.initialized = (async () => {
-                const stored = await chrome.storage.local.get(null);
-                this.job = stored[this.jobKey];
+                // Read every key only to recover an existing job; saved ID records grow without limit.
+                this.job = (await chrome.storage.local.get(this.jobKey))[this.jobKey];
+                const stored = this.job ? await chrome.storage.local.get(null) : {};
                 if (this.job)
                     for (const [key, task] of Object.entries(stored))
                         if (key.startsWith(this.taskPrefix + this.job.id + ':'))
@@ -58,6 +97,7 @@ export class SaveJobs {
         return write;
     }
     key(id) { return this.taskPrefix + this.job.id + ':' + id; }
+    storageKeys() { return this.job ? [this.jobKey, ...[...this.tasks.keys()].map(id => this.key(id))] : [this.jobKey]; }
     async finish() { this.kick(); await this.running; return this.status(); }
     // Queue snapshots are captured at acceptance, so transfers never need the article again.
     async captured(id, tabId, postId, snap, preferences, saveAs = false) {
@@ -232,6 +272,8 @@ export class SaveJobs {
             await chrome.storage.local.set(rows);
         for (const task of Object.values(rows))
             this.tasks.set(mediaKey(task.media), task);
+        if (Object.keys(rows).length)
+            this.signal();
         this.job.issues = this.job.issues.filter(issue => !(page.verifiedPostIds ?? []).some(id => issue.startsWith(`投稿 ${id}:`) && /全画像|読み込まれていない画像|非表示の画像|動画の全データ/.test(issue)));
         for (const issue of page.issues)
             if (!this.job.issues.includes(issue))
@@ -271,7 +313,7 @@ export class SaveJobs {
                 if (!task) {
                     if (!collecting && ![...this.tasks.values()].some(t => ['pending', 'starting', 'downloading'].includes(t.state)))
                         break;
-                    await delay(100);
+                    await this.nap(100);
                     continue;
                 }
                 active.add(mediaKey(task.media));
@@ -284,6 +326,7 @@ export class SaveJobs {
                 }
                 finally {
                     active.delete(mediaKey(task.media));
+                    this.signal();
                 }
             }
         })());
@@ -301,7 +344,7 @@ export class SaveJobs {
                 }
                 // Bound the durable queue as well as the transfer concurrency.
                 if ([...this.tasks.values()].filter(t => ['pending', 'starting', 'downloading'].includes(t.state)).length > 48) {
-                    await delay(100);
+                    await this.nap(100);
                     continue;
                 }
                 if (job.source === 'network' || job.source === 'direct' || job.source === 'account') {
@@ -358,6 +401,7 @@ export class SaveJobs {
         }
         finally {
             collecting = false;
+            this.signal();
         }
         await Promise.all(workers);
         if (sourceError) {
@@ -402,44 +446,51 @@ export class SaveJobs {
         }
         const deadline = Date.now() + (task.media.kind === 'video' ? 600000 : 120000);
         while (true) {
-            // A monitoring failure retains the ID, rather than starting a second transfer.
-            const [item] = await chrome.downloads.search({ id: task.downloadId });
-            if (!item || item.state === 'interrupted') {
-                task.state = this.job.source === 'current' && userCanceled(item?.error) ? 'canceled' : 'failed';
-                task.error = task.state === 'canceled' ? undefined : item?.error ?? 'ダウンロードの状態を確認できません。';
-                task.downloadId = undefined;
-                await this.taskWrite(task);
-                return;
-            }
-            if (item.state === 'complete') {
-                if (!isMediaDownload(item, task.media)) {
-                    task.state = 'failed';
-                    task.error = '保存ファイルの形式・URL・存在を確認できません。';
+            // Subscribe before reading the state, so a change between them is not missed.
+            const change = downloadChange(task.downloadId, 1000);
+            try {
+                // A monitoring failure retains the ID, rather than starting a second transfer.
+                const [item] = await chrome.downloads.search({ id: task.downloadId });
+                if (!item || item.state === 'interrupted') {
+                    task.state = this.job.source === 'current' && userCanceled(item?.error) ? 'canceled' : 'failed';
+                    task.error = task.state === 'canceled' ? undefined : item?.error ?? 'ダウンロードの状態を確認できません。';
                     task.downloadId = undefined;
                     await this.taskWrite(task);
                     return;
                 }
-                // History write failure keeps the complete ID, so retry only the record.
-                await this.history.record(task.media, task.downloadId);
-                task.state = 'saved';
-                task.error = undefined;
-                await this.taskWrite(task);
-                return;
+                if (item.state === 'complete') {
+                    if (!isMediaDownload(item, task.media)) {
+                        task.state = 'failed';
+                        task.error = '保存ファイルの形式・URL・存在を確認できません。';
+                        task.downloadId = undefined;
+                        await this.taskWrite(task);
+                        return;
+                    }
+                    // History write failure keeps the complete ID, so retry only the record.
+                    await this.history.record(task.media, task.downloadId);
+                    task.state = 'saved';
+                    task.error = undefined;
+                    await this.taskWrite(task);
+                    return;
+                }
+                if (Date.now() >= deadline) {
+                    await chrome.downloads.cancel(task.downloadId);
+                    const [after] = await chrome.downloads.search({ id: task.downloadId });
+                    if (after?.state === 'complete')
+                        continue;
+                    if (after?.state !== 'interrupted')
+                        throw new Error('転送の停止を確認できません。ダウンロードIDを保持しました。');
+                    task.state = 'failed';
+                    task.error = 'ファイルの転送が時間切れになりました。';
+                    task.downloadId = undefined;
+                    await this.taskWrite(task);
+                    return;
+                }
+                await change.wait;
             }
-            if (Date.now() >= deadline) {
-                await chrome.downloads.cancel(task.downloadId);
-                const [after] = await chrome.downloads.search({ id: task.downloadId });
-                if (after?.state === 'complete')
-                    continue;
-                if (after?.state !== 'interrupted')
-                    throw new Error('転送の停止を確認できません。ダウンロードIDを保持しました。');
-                task.state = 'failed';
-                task.error = 'ファイルの転送が時間切れになりました。';
-                task.downloadId = undefined;
-                await this.taskWrite(task);
-                return;
+            finally {
+                change.cancel();
             }
-            await delay(1000);
         }
     }
 }
@@ -536,13 +587,17 @@ export class PostSaveQueue {
             // Keep failures and issues for inspection; they never block the next reservation.
             request.result = result;
             request.state = 'finished';
+            request.keys = saves.storageKeys();
             await this.write(request);
             this.current = undefined;
             // Retain the latest 100 successful results; unresolved reservations are never pruned.
             const completed = [...this.requests.values()].filter(r => r.state === 'finished' && r.result?.job?.status === 'done');
-            for (const old of completed.slice(0, Math.max(0, completed.length - 100))) {
-                const stored = await chrome.storage.local.get(null);
-                await chrome.storage.local.remove(Object.keys(stored).filter(key => key === POST_PREFIX + old.id || key === 'localSaveJob:' + old.id || key.startsWith('localSaveTask:' + old.id + ':')));
+            const prune = completed.slice(0, Math.max(0, completed.length - 100));
+            // Recorded keys avoid reading all saved IDs; older results without them need one full read.
+            const stored = prune.some(old => !old.keys) ? await chrome.storage.local.get(null) : {};
+            for (const old of prune) {
+                const keys = old.keys ?? Object.keys(stored).filter(key => key === 'localSaveJob:' + old.id || key.startsWith('localSaveTask:' + old.id + ':'));
+                await chrome.storage.local.remove([...new Set([POST_PREFIX + old.id, ...keys])]);
                 this.requests.delete(old.id);
             }
         }
