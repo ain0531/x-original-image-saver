@@ -13,28 +13,40 @@ const validRoute = (raw) => {
         return false;
     }
 };
-function featureValues(text) {
+export function featureValues(text) {
     const values = {};
-    for (const match of text.matchAll(/"([a-zA-Z0-9_]+)"\s*:\s*\{\s*"value"\s*:\s*(true|false)/g))
-        values[match[1]] = match[2] === 'true';
+    // Parse literal values only; do not evaluate downloaded JavaScript.
+    const boolean = (raw) => raw === 'true' || raw === '!0';
+    for (const match of text.matchAll(/["']?([a-zA-Z0-9_]+)["']?\s*:\s*\{\s*["']?value["']?\s*:\s*(true|false|!0|!1)\s*(?=[,}])/g))
+        values[match[1]] = boolean(match[2]);
+    for (const match of text.matchAll(/["']?([a-zA-Z0-9_]+)["']?\s*:\s*(true|false|!0|!1)\s*(?=[,}])/g))
+        if (!(match[1] in values))
+            values[match[1]] = boolean(match[2]);
     return values;
 }
-export function clientBookmarkConfig(text, values) {
-    const match = /queryId\s*:\s*"([A-Za-z0-9_-]+)"\s*,\s*operationName\s*:\s*"Bookmarks"/.exec(text);
+export function clientBookmarkConfig(text, values, operation = 'Bookmarks') {
+    const queryId = '["\']?queryId["\']?\\s*:\\s*["\']([A-Za-z0-9_-]+)["\']';
+    const name = '["\']?operationName["\']?\\s*:\\s*["\']' + operation + '["\']';
+    const match = new RegExp(queryId + '\\s*,\\s*' + name + '|' + name + '\\s*,\\s*' + queryId).exec(text);
     if (!match)
         return;
     const section = text.slice(match.index, match.index + 6000);
-    const list = /featureSwitches\s*:\s*\[([^\]]*)\]/.exec(section)?.[1];
+    const list = /["']?featureSwitches["']?\s*:\s*\[([^\]]*)\]/.exec(section)?.[1];
     if (list === undefined)
         return;
     const features = {};
-    for (const name of list.matchAll(/"([a-zA-Z0-9_]+)"/g)) {
-        if (typeof values[name[1]] !== 'boolean')
-            throw new Error('Xのブックマーク取得設定を確認できません。ログイン済みのXを再読み込みして再試行してください。');
-        features[name[1]] = values[name[1]];
+    for (const name of list.matchAll(/["']([a-zA-Z0-9_]+)["']/g)) {
+        const key = name[1];
+        // Narrow compatibility setting, not a blanket false for unknown features.
+        // Native captured requests also use false for this reply-downvote flag:
+        // https://github.com/fa0311/twitter_api_safe_relay_skills/blob/main/skills/twitter-api-relay/requests.ndjson
+        const value = typeof values[key] === 'boolean' ? values[key] : operation !== 'Bookmarks' && key === 'rweb_conversational_replies_downvote_enabled' ? false : undefined;
+        if (typeof value !== 'boolean')
+            throw new Error(`Xの${operation === 'Bookmarks' ? 'ブックマーク' : 'アカウントメディア'}取得設定を確認できません（不足: ${key}）。`);
+        features[key] = value;
     }
     const token = /["'](AAAAAAA[A-Za-z0-9%_-]{30,})["']/.exec(text)?.[1];
-    return { route: `${ORIGIN}/i/api/graphql/${match[1]}/Bookmarks`, authorization: token ? `Bearer ${token}` : undefined, features };
+    return { route: `${ORIGIN}/i/api/graphql/${match[1] ?? match[2]}/${operation}`, authorization: token ? `Bearer ${token}` : undefined, features };
 }
 export class DirectBookmarks {
     constructor() {
@@ -63,6 +75,20 @@ export class DirectBookmarks {
         const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(auth));
         const fingerprint = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
         return { storeId, csrf, scope: JSON.stringify([ORIGIN + '/i/bookmarks', 'Bookmarks', storeId + ':' + fingerprint]) };
+    }
+    async login(tabId) {
+        const storeId = await this.cookieStore(tabId);
+        const expected = chrome.extension.inIncognitoContext ? '1' : '0';
+        if (storeId !== expected)
+            throw new Error('このブラウザー領域では直接取得を実行できません。通常のウィンドウで実行してください。');
+        return this.identity(storeId);
+    }
+    async sessionIdentity(storeId) { return this.identity(storeId); }
+    async clientSession(storeId, scope) {
+        await this.captures;
+        await this.check(storeId, scope);
+        const saved = (await chrome.storage.session.get(DIRECT_KEY + storeId))[DIRECT_KEY + storeId];
+        return saved?.scope === scope ? { authorization: saved.authorization, features: saved.features ?? {} } : { features: {} };
     }
     async capture(details) {
         const headers = new Map((details.requestHeaders ?? []).map(header => [header.name.toLowerCase(), header.value ?? '']));

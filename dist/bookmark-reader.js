@@ -7,6 +7,7 @@
     const nativeFetch = window.fetch.bind(window);
     let template;
     let initialPage;
+    let accountInitial;
     const postImages = new Map();
     const scope = () => {
         const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
@@ -151,6 +152,30 @@
         }
         catch { /* Only a proven first page can initialize a batch. */ }
     };
+    const rememberAccount = (raw, body, requestScope, method, requestBody) => {
+        if (!compatible(requestScope, scope()))
+            return;
+        try {
+            const url = new URL(raw, location.href);
+            if (url.origin !== location.origin || !/^\/i\/api\/graphql\/[^/]+\/UserMedia$/.test(url.pathname))
+                return;
+            const page = new URL(JSON.parse(requestScope)[0]);
+            const handle = page.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/media\/?$/)?.[1];
+            if (!handle)
+                return;
+            const payload = method === 'POST' && typeof requestBody === 'string' ? JSON.parse(requestBody) : undefined;
+            const variables = payload?.variables ?? JSON.parse(url.searchParams.get('variables') ?? 'null');
+            const user = body?.data?.user?.result;
+            if (!variables || variables.cursor || typeof variables.userId !== 'string' || !/^\d+$/.test(variables.userId) || user?.rest_id !== variables.userId)
+                return;
+            const returnedHandle = user?.core?.screen_name ?? user?.legacy?.screen_name;
+            if (returnedHandle && String(returnedHandle).toLowerCase() !== handle.toLowerCase())
+                return;
+            const booleans = (value) => value && typeof value === 'object' && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).filter(([, flag]) => typeof flag === 'boolean')) : {};
+            accountInitial = { data: body, scope: requestScope, userId: variables.userId, request: { url: url.toString(), method: method === 'POST' ? 'POST' : 'GET', variables, features: booleans(payload?.features ?? JSON.parse(url.searchParams.get('features') ?? '{}')), fieldToggles: booleans(payload?.fieldToggles ?? JSON.parse(url.searchParams.get('fieldToggles') ?? '{}')) } };
+        }
+        catch { /* Only a matching first native media response can initialize a scan. */ }
+    };
     window.fetch = async (input, init) => {
         const url = input instanceof Request ? input.url : String(input);
         const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
@@ -159,11 +184,19 @@
         const headers = new Headers(input instanceof Request ? input.headers : undefined);
         new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
         const requestScope = scope();
+        // Inspect only media query bodies; a failed clone must never block X's request.
+        let requestBody = init?.body;
+        if (method.toUpperCase() === 'POST' && /\/UserMedia(?:\?|$)/.test(url) && requestBody === undefined && input instanceof Request) {
+            try {
+                requestBody = await input.clone().text();
+            }
+            catch { /* Native request still proceeds. */ }
+        }
         const response = await nativeFetch(input, init);
         if (response.ok) {
             if (method.toUpperCase() === 'GET' && accepts(url))
                 capture(url, headers, requestScope);
-            void response.clone().json().then(body => { remember(body, requestScope); if (method.toUpperCase() === 'GET')
+            void response.clone().json().then(body => { remember(body, requestScope); rememberAccount(url, body, requestScope, method.toUpperCase(), requestBody); if (method.toUpperCase() === 'GET')
                 rememberInitial(url, body, requestScope); }).catch(() => { });
         }
         return response;
@@ -193,6 +226,7 @@
                             capture(request.url, request.headers, request.scope);
                         const data = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
                         remember(data, request.scope);
+                        rememberAccount(request.url, data, request.scope, request.method, body);
                         if (request.method === 'GET')
                             rememberInitial(request.url, data, request.scope);
                     }
@@ -204,6 +238,37 @@
     let busy = false;
     host.__xImageBookmarkReader = async (operation, cursor, expectedScope, postIds) => {
         const current = scope();
+        if (operation === 'account-config') {
+            // Return only public asset URLs and explicit boolean feature values.
+            // Never serialize the initial state itself (it can contain account data).
+            const features = {};
+            const switches = host.__INITIAL_STATE__?.featureSwitch;
+            for (const layer of [switches?.defaultConfig, switches?.config, switches?.user]) {
+                if (!layer || typeof layer !== 'object')
+                    continue;
+                for (const [key, entry] of Object.entries(layer)) {
+                    const value = typeof entry === 'boolean' ? entry : entry?.value;
+                    if (/^[A-Za-z0-9_]+$/.test(key) && typeof value === 'boolean')
+                        features[key] = value;
+                }
+            }
+            const resources = [...Array.from(document.scripts ?? [], script => script.src), ...performance.getEntriesByType('resource').map(entry => entry.name)];
+            const assets = [...new Set(resources.filter(raw => {
+                    try {
+                        const url = new URL(raw);
+                        return url.origin === 'https://abs.twimg.com' && /^\/responsive-web\/[A-Za-z0-9_./-]+\.js$/.test(url.pathname) && !url.search;
+                    }
+                    catch {
+                        return false;
+                    }
+                }))].slice(0, 64);
+            return { pageUrl: location.href, features, assets };
+        }
+        if (operation === 'account-bootstrap') {
+            if (!accountInitial || !compatible(accountInitial.scope, current))
+                return { available: false, reason: 'no-native-media-first-page' };
+            return { available: true, data: accountInitial.data, userId: accountInitial.userId, request: accountInitial.request };
+        }
         if (operation === 'bootstrap') {
             if (!initialPage || !compatible(initialPage.scope, current))
                 return { available: false, scope: current, documentId: performance.timeOrigin };

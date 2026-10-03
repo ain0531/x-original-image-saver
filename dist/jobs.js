@@ -2,6 +2,7 @@ import { errorText, isMediaDownload, isXPage, mediaKey } from './media.js';
 import { ImageHistory } from './history.js';
 import { snapshot, network, domPage, assertBookmarkScope, likePost } from './sources.js';
 import { directBookmarks } from './direct-bookmarks.js';
+import { directAccountMedia, assertAccountMediaScope } from './direct-account-media.js';
 import { DEFAULT_OPTIONS, getOptions, downloadFileName } from './preferences.js';
 const JOB_KEY = 'imageSaveJob';
 const TASK_PREFIX = 'imageSaveTask:';
@@ -113,6 +114,8 @@ export class SaveJobs {
             this.job.skip = true;
             if (this.job.source === 'direct')
                 await directBookmarks.check(this.job.cookieStoreId, this.job.scope);
+            else if (this.job.source === 'account')
+                await directAccountMedia.check(this.job.cookieStoreId, this.job.scope);
             else {
                 const tab = await chrome.tabs.get(this.job.tabId);
                 if (tab.url !== this.job.url)
@@ -129,7 +132,7 @@ export class SaveJobs {
                     task.error = undefined;
                     await this.taskWrite(task);
                 }
-            if (this.job.endedBy !== 'timeline-end' && ['network', 'direct'].includes(this.job.source))
+            if (this.job.endedBy !== 'timeline-end' && ['network', 'direct', 'account'].includes(this.job.source))
                 this.job.sourceDone = false;
             this.job.rounds = 0;
             this.job.status = 'running';
@@ -152,15 +155,16 @@ export class SaveJobs {
         if (current && !isXPage(tab.url ?? ''))
             throw new Error('Xのページを開いてください。');
         const preferences = await getOptions();
-        const target = current ? undefined : await directBookmarks.prepare(message.tabId);
+        const accountMode = message.type === 'SAVE_ACCOUNT_MEDIA';
+        const target = current ? undefined : accountMode ? await directAccountMedia.prepare(message.tabId) : await directBookmarks.prepare(message.tabId);
         const tabId = message.tabId;
         const requestedPost = current && typeof message.postId === 'string' && /^\d+$/.test(message.postId) ? message.postId : undefined;
-        const snap = target ? { pageUrl: 'https://x.com/i/bookmarks', scope: target.scope, documentId: 0, urls: [], posts: [], issues: [], loading: false, bottom: false, y: 0 } : await snapshot(tabId, true, requestedPost);
+        const snap = target ? { pageUrl: target.url ?? 'https://x.com/i/bookmarks', scope: target.scope, documentId: 0, urls: [], posts: [], issues: [], loading: false, bottom: false, y: 0 } : await snapshot(tabId, true, requestedPost);
         if (requestedPost && !snap.posts.includes(requestedPost))
             throw new Error('指定した投稿を確認できません。タイムラインに投稿を表示して再試行してください。');
         const selectedPost = current ? requestedPost ?? snap.posts.find(id => /^\d+$/.test(id)) : undefined;
         if (!current)
-            assertBookmarkScope(snap.pageUrl, snap.scope);
+            (accountMode ? assertAccountMediaScope : assertBookmarkScope)(snap.pageUrl, snap.scope);
         if (current && snap.pageUrl !== tab.url)
             throw new Error('ページが変わりました。もう一度開始してください。');
         // Never drop unfinished work when starting from a new head/current position.
@@ -183,7 +187,7 @@ export class SaveJobs {
         const stored = await chrome.storage.local.get(null);
         const oldKeys = Object.keys(stored).filter(key => key.startsWith(this.taskPrefix));
         const job = { id: String(Date.now()) + '-' + Math.random().toString(36).slice(2), tabId, url: snap.pageUrl, scope: snap.scope, documentId: snap.documentId, background: !current, cookieStoreId: target?.storeId,
-            source: current ? 'current' : 'direct', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope && (!current || this.job.postId === selectedPost) ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: true, settings: settings(message.scrollSettings ?? { maxRounds: preferences.maxPages, maxElapsedMs: preferences.maxSeconds * 1000 }), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: current && message.saveAs === true, postId: selectedPost };
+            source: current ? 'current' : accountMode ? 'account' : 'direct', status: 'running', rounds: 0, sourceDone: false, endedBy: '', issues: this.job?.scope === snap.scope && (!current || this.job.postId === selectedPost) ? this.job.issues.filter(issue => !issue.startsWith('ブックマークの通信')) : [], skip: true, settings: settings(message.scrollSettings ?? { maxRounds: preferences.maxPages, maxElapsedMs: preferences.maxSeconds * 1000 }), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: current && message.saveAs === true, postId: selectedPost };
         // Save the new job and carried queue before removing the old queue.
         const carried = { [this.jobKey]: job };
         for (const task of pending)
@@ -250,9 +254,11 @@ export class SaveJobs {
         if (!job || job.status !== 'running')
             return;
         if (job.source !== 'current')
-            assertBookmarkScope(job.url, job.scope);
+            (job.source === 'account' ? assertAccountMediaScope : assertBookmarkScope)(job.url, job.scope);
         if (job.source === 'direct')
             await directBookmarks.check(job.cookieStoreId, job.scope);
+        if (job.source === 'account')
+            await directAccountMedia.check(job.cookieStoreId, job.scope);
         // Downloads are processed while the next page is collected, at most four.
         let collecting = true;
         const workers = Array.from({ length: job.source === 'current' ? 1 : 4 }, () => (async () => {
@@ -292,8 +298,8 @@ export class SaveJobs {
                     await delay(100);
                     continue;
                 }
-                if (job.source === 'network' || job.source === 'direct') {
-                    const page = job.source === 'direct' ? await directBookmarks.page(job.cookieStoreId, job.scope, job.cursor) : await (async () => {
+                if (job.source === 'network' || job.source === 'direct' || job.source === 'account') {
+                    const page = job.source === 'account' ? await directAccountMedia.page(job.cookieStoreId, job.scope, job.cursor) : job.source === 'direct' ? await directBookmarks.page(job.cookieStoreId, job.scope, job.cursor) : await (async () => {
                         const result = await network(job.tabId, 'page', job.cursor, job.scope);
                         if (!result.available || !result.page)
                             throw new Error('ブックマークの通信を確認できません。対象ページを再読み込みして再開してください。');

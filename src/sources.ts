@@ -10,7 +10,7 @@ export function assertBookmarkScope(pageUrl: string, scope: string): void {
       (/^\/i\/bookmarks(?:\/[^/]+)*\/?$/.test(path) ||
         /^\/i\/history\/?$/.test(path) && /^(ブックマーク|Bookmarks)[▼▾⌄]?$/i.test(String(selected).replace(/\s/g, '')));
   } catch { /* Unknown page state cannot authorize a bookmark save. */ }
-  if (!valid) throw new Error('ブックマークのページを開いてから画像をまとめて保存してください。履歴ページでは「ブックマーク」を選択してください。');
+  if (!valid) throw new Error('ブックマークのページを開いてからまとめて保存してください。履歴ページでは「ブックマーク」を選択してください。');
 }
 export async function snapshot(tabId: number, current = false, targetPostId?: string): Promise<Snapshot> {
   const args: [boolean, string?] = targetPostId ? [current, targetPostId] : [current];

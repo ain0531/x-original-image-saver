@@ -135,3 +135,15 @@ test('save-location checkbox restores and writes the shared local-save setting b
   assert.equal(writes[0].specifySaveLocation, false); assert.equal(h.messages.length, 0);
   release(); await flush(); assert.equal(h.messages[0].saveAs, false);
 });
+
+test('bulk save defaults to bookmarks and routes the selected account mode with its explanation', async () => {
+  const html = fs.readFileSync('sidepanel.html', 'utf8');
+  assert.match(html, /id="save-all-visible">まとめて保存</); assert.match(html, /value="bookmarks" selected/);
+  assert.ok(html.indexOf('id="bulk-save-mode"') > html.indexOf('id="save-all-visible"'));
+  const h = harness(); await flush();
+  const mode = h.elements.get('bulk-save-mode'); assert.equal(mode.value, 'bookmarks');
+  h.elements.get('save-all-visible').click(); await flush(); assert.equal(h.messages[0].type, 'SAVE_ALL_VISIBLE_IMAGES');
+  mode.value = 'account'; mode.change(); assert.equal(h.elements.get('bulk-save-description').textContent, '現在開いているアカウントのメディアを保存します。');
+  h.elements.get('save-all-visible').click(); await flush(); assert.equal(h.messages[1].type, 'SAVE_ACCOUNT_MEDIA');
+  assert.equal(h.messages[1].saveAs, false);
+});

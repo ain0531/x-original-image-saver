@@ -11,7 +11,7 @@ export function assertBookmarkScope(pageUrl, scope) {
     }
     catch { /* Unknown page state cannot authorize a bookmark save. */ }
     if (!valid)
-        throw new Error('ブックマークのページを開いてから画像をまとめて保存してください。履歴ページでは「ブックマーク」を選択してください。');
+        throw new Error('ブックマークのページを開いてからまとめて保存してください。履歴ページでは「ブックマーク」を選択してください。');
 }
 export async function snapshot(tabId, current = false, targetPostId) {
     const args = targetPostId ? [current, targetPostId] : [current];

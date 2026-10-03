@@ -20,6 +20,50 @@ function readerHarness() {
   return { window, requests, context, articles, set body(value) { responseBody = value; }, set selected(value) { selected = value; }, set account(value) { account = value; } };
 }
 const nativeUrl = 'https://x.com/i/api/graphql/NATIVE_ID/Bookmarks?variables=' + encodeURIComponent(JSON.stringify({ count: 20, cursor: 'old', includePromotedContent: false })) + '&features=%7B%22native%22%3Atrue%7D';
+
+test('account config exposes only loaded public assets and explicit effective boolean flags', async () => {
+  const h = readerHarness(); h.context.location.href = 'https://x.com/alice';
+  const good = 'https://abs.twimg.com/responsive-web/client-web/chunk.MEDIA.js';
+  h.context.document.scripts = [{ src: good }, { src: 'https://evil.invalid/code.js' }];
+  h.context.performance.getEntriesByType = () => [{ name: good }, { name: 'https://abs.twimg.com/responsive-web/client-web/main.PUBLIC.js' }, { name: 'https://x.com/i/api/graphql/private?token=secret' }];
+  h.window.__INITIAL_STATE__ = { session: { auth_token: 'secret' }, featureSwitch: { defaultConfig: { flag: { value: false }, text: { value: 'secret' } }, config: { other: { value: true } }, user: { flag: { value: true } } } };
+  const result = await h.window.__xImageBookmarkReader('account-config');
+  assert.equal(result.pageUrl, 'https://x.com/alice'); assert.equal(result.features.flag, true); assert.equal(result.features.other, true);
+  assert.equal(result.assets.length, 2); assert.ok(result.assets.includes(good)); assert.ok(!JSON.stringify(result).includes('secret'));
+});
+
+for (const transport of ['GET', 'POST', 'Request', 'XHR']) test(`native account first-page capture supports ${transport} without lookup or exposing headers`, async () => {
+  const h = readerHarness(); h.context.location.href = 'https://x.com/alice/media'; h.account = 'user'; h.selected = 'メディア';
+  h.body = { data: { user: { result: { rest_id: '42', core: { screen_name: 'alice' }, timeline_v2: { timeline: { instructions: [] } } } } } };
+  const payload = { variables: { userId: '42', count: 20 }, features: { flag: true }, fieldToggles: { article: false } };
+  const url = new URL('https://x.com/i/api/graphql/NATIVE/UserMedia');
+  if (transport === 'GET') {
+    for (const [key, value] of Object.entries(payload)) url.searchParams.set(key, JSON.stringify(value));
+    await h.window.fetch(url.toString(), { headers: { authorization: 'private-token' } });
+  } else if (transport === 'XHR') {
+    const xhr = new h.context.XMLHttpRequest(); xhr.open('POST', url.toString()); xhr.setRequestHeader('authorization', 'private-token'); xhr.send(JSON.stringify(payload));
+    xhr.status = 200; xhr.responseType = 'json'; xhr.response = { data: { user: { result: { rest_id: '42', timeline_v2: { timeline: { instructions: [] } } } } } }; xhr.load();
+  } else {
+    const init = { method: 'POST', headers: { authorization: 'private-token' }, body: JSON.stringify(payload) };
+    await h.window.fetch(transport === 'Request' ? new Request(url, init) : url.toString(), transport === 'Request' ? undefined : init);
+  }
+  const result = await h.window.__xImageBookmarkReader('account-bootstrap');
+  assert.equal(result.available, true); assert.equal(result.userId, '42'); assert.equal(result.request.features.flag, true);
+  assert.equal(result.request.method, transport === 'GET' ? 'GET' : 'POST');
+  assert.ok(!JSON.stringify(result).includes('private-token')); assert.equal(h.requests.length, transport === 'XHR' ? 0 : 1);
+  h.account = 'other'; assert.equal((await h.window.__xImageBookmarkReader('account-bootstrap')).available, false);
+});
+
+test('account first-page capture rejects cursor pages and mismatched owners', async () => {
+  for (const scenario of ['cursor', 'id', 'handle']) {
+    const h = readerHarness(); h.context.location.href = 'https://x.com/alice/media';
+    h.body = { data: { user: { result: { rest_id: scenario === 'id' ? '99' : '42', core: { screen_name: scenario === 'handle' ? 'bob' : 'alice' } } } } };
+    const url = new URL('https://x.com/i/api/graphql/NATIVE/UserMedia');
+    url.searchParams.set('variables', JSON.stringify({ userId: '42', ...(scenario === 'cursor' ? { cursor: 'next' } : {}) }));
+    await h.window.fetch(url.toString());
+    assert.equal((await h.window.__xImageBookmarkReader('account-bootstrap')).available, false);
+  }
+});
 test('bootstrap returns only native first-page bookmarks without another fetch or credentials', async () => {
   const h = readerHarness(); h.selected = 'ブックマーク'; h.account = 'user';
   await h.window.fetch(nativeUrl);

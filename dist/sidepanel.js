@@ -4,6 +4,15 @@ if (versionElement)
     versionElement.textContent = `バージョン ${chrome.runtime.getManifest?.()?.version ?? ''}`;
 const saveCurrentTweetButton = document.getElementById("save-current-tweet");
 const saveAllVisibleButton = document.getElementById("save-all-visible");
+const bulkModeInput = document.getElementById('bulk-save-mode');
+function describeBulkMode() {
+    const description = document.getElementById('bulk-save-description');
+    if (description)
+        description.textContent = bulkModeInput?.value === 'account'
+            ? '現在開いているアカウントのメディアを保存します。'
+            : 'ブックマークに保存された投稿から動画と画像を保存します。';
+}
+bulkModeInput?.addEventListener('change', describeBulkMode);
 const clearSavedHistoryButton = document.getElementById("clear-saved-history");
 const checkCurrentSavedListInput = document.getElementById("check-current-saved-list");
 const specifySaveLocationInput = document.getElementById('specify-save-location');
@@ -50,6 +59,9 @@ async function getSavedMediaCount() {
     return Object.keys(stored).filter(key => key.startsWith('savedImage:') || key.startsWith('savedVideo:')).length;
 }
 async function initializeSidePanel() {
+    if (bulkModeInput)
+        bulkModeInput.value = 'bookmarks';
+    describeBulkMode();
     const stored = await chrome.storage.local.get(['imageSaverOptions', 'likeOnSave', 'specifySaveLocation']);
     if (specifySaveLocationInput)
         specifySaveLocationInput.checked = stored.specifySaveLocation === true;
@@ -85,14 +97,15 @@ bindAction(saveCurrentTweetButton, async () => {
     renderProgress(response);
 });
 bindAction(saveAllVisibleButton, async () => {
+    const accountMode = bulkModeInput?.value === 'account';
     const activeTab = await getActiveTab();
     if (!activeTab?.id) {
         setStatus("開いているタブを確認できません。");
         return;
     }
-    setStatus("ブックマークの初回データを取得しています。必要な場合は取得用タブを一時的に開き、通信後に自動で閉じます...");
+    setStatus(accountMode ? 'アカウントのメディア一覧を取得しています。必要な場合は取得用タブを一時的に開き、通信後に自動で閉じます...' : "ブックマークの初回データを取得しています。必要な場合は取得用タブを一時的に開き、通信後に自動で閉じます...");
     const response = (await chrome.runtime.sendMessage({
-        type: "SAVE_ALL_VISIBLE_IMAGES",
+        type: accountMode ? 'SAVE_ACCOUNT_MEDIA' : "SAVE_ALL_VISIBLE_IMAGES",
         tabId: activeTab.id,
         tabUrl: activeTab.url ?? "",
         saveAs: false,
@@ -127,7 +140,7 @@ function renderProgress(response) {
     jobActive = job?.status === 'running';
     workerBusy = response.busy === true;
     watchProgress = jobActive || response.busy === true || (response.localQueue?.pending ?? 0) > 0;
-    const source = job?.source === 'direct' ? 'ブックマークのデータを取得（タブなし）' : job?.source === 'network' ? 'ブックマークの投稿データを直接取得（スクロールなし）' : job?.source === 'loaded' ? '読み込み済み画像のみ（スクロールなし）' : '現在の投稿';
+    const source = job?.source === 'account' ? `個別アカウントのメディアを取得（スクロールなし）\n対象: ${job.url}` : job?.source === 'direct' ? 'ブックマークのデータを取得（タブなし）' : job?.source === 'network' ? 'ブックマークの投稿データを直接取得（スクロールなし）' : job?.source === 'loaded' ? '読み込み済み画像のみ（スクロールなし）' : '現在の投稿';
     const reasons = {
         'timeline-end': '投稿データの末尾まで取得', 'max-rounds': '取得ページ数の上限。続きは未取得',
         'max-time': '取得時間の上限。続きは未取得', 'loaded-only': '読み込み済みの範囲のみ。全件の取得は未確認',

@@ -16,7 +16,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         void operation.then(result => sendResponse({ ok: true, ...result }), error => sendResponse({ ok: false, error: errorText(error) }));
         return true;
     }
-    const types = ['SAVE_ALL_VISIBLE_IMAGES', 'SAVE_CURRENT_TWEET_IMAGES', 'CLEAR_SAVED_HISTORY', 'GET_SAVE_STATUS', 'PAUSE_SAVE', 'RESUME_SAVE'];
+    const types = ['SAVE_ALL_VISIBLE_IMAGES', 'SAVE_ACCOUNT_MEDIA', 'SAVE_CURRENT_TWEET_IMAGES', 'CLEAR_SAVED_HISTORY', 'GET_SAVE_STATUS', 'PAUSE_SAVE', 'RESUME_SAVE'];
     if (!types.includes(message?.type))
         return false;
     const trustedPanel = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL('sidepanel.html');

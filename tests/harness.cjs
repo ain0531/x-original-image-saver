@@ -15,11 +15,11 @@ function harness(initial = {}) {
   let backgroundAvailable = true;
   let networkAvailable = false;
   const pages = []; const cached = [];
-  const session = {}; const directRequests = []; let auth = 'logged-in-account'; let csrf = 'csrf-test'; let requestObserver;
+  const session = {}; const directRequests = []; let auth = 'logged-in-account'; let csrf = 'csrf-test'; const requestObservers = [];
   const chrome = {
     extension: { inIncognitoContext: false },
     cookies: { getAllCookieStores: async () => [{ id: '0', tabIds: [1] }], getAll: async () => auth ? [{ name: 'auth_token', value: auth }, { name: 'ct0', value: csrf }] : [] },
-    webRequest: { onBeforeSendHeaders: { addListener: callback => { requestObserver = callback; } } },
+    webRequest: { onBeforeSendHeaders: { addListener: callback => { requestObservers.push(callback); } } },
     runtime: { id: 'test', getURL: p => 'chrome-extension://test/' + p, onMessage: { addListener: l => listener = l } },
     sidePanel: { setPanelBehavior: async () => {} },
     alarms: { create: async () => {}, onAlarm: { addListener() {} } },
@@ -55,12 +55,12 @@ function harness(initial = {}) {
     return { ok: true, json: async () => pages.length ? pages.shift() : page(ids) };
   };
   const context = vm.createContext({ chrome, fetch, crypto: require('node:crypto').webcrypto, TextEncoder, AbortController, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
-  for (const name of ['media', 'preferences', 'history', 'bookmarks', 'sources', 'direct-bookmarks', 'jobs', 'background']) {
+  for (const name of ['media', 'preferences', 'history', 'bookmarks', 'sources', 'direct-bookmarks', 'direct-account-media', 'jobs', 'background']) {
     const source = fs.readFileSync('dist/' + name + '.js', 'utf8').replace(/^import .*;\s*$/mg, '').replace(/\bexport (?=(?:async|class|function|const))/g, '').replace(/export\s*\{\s*\};?/g, '');
     vm.runInContext(source, context, { filename: name });
   }
   const request = (message, sender = { id: 'test', url: 'chrome-extension://test/sidepanel.html' }) => new Promise(resolve => listener(message, sender, resolve));
-  return { context, chrome, calls, states, injections, snap, backgroundSnap, createdTabs, removedTabs, pages, cached, scope, directRequests, session, observe: details => requestObserver(details), set auth(value) { auth = value; }, set csrf(value) { csrf = value; }, request, get store() { return store; }, set available(value) { networkAvailable = value; }, set backgroundAvailable(value) { backgroundAvailable = value; }, async done() {
+  return { context, chrome, calls, states, injections, snap, backgroundSnap, createdTabs, removedTabs, pages, cached, scope, directRequests, session, observe: details => requestObservers.forEach(observer => observer(details)), set auth(value) { auth = value; }, set csrf(value) { csrf = value; }, request, get store() { return store; }, set available(value) { networkAvailable = value; }, set backgroundAvailable(value) { backgroundAvailable = value; }, async done() {
     for (let n = 0; n < 200; n++) { await flush(); const status = await request({ type: 'GET_SAVE_STATUS' }); if (status.job?.status !== 'running' && !status.busy) return status; await new Promise(r => setTimeout(r, 5)); }
     throw new Error('Job did not finish');
   } };

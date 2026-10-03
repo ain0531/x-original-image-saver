@@ -79,8 +79,13 @@
       </div>
 
       <div class="action-row">
-        <button id="save-all-visible">画像をまとめて保存</button>
-        <p style="margin:0;font-size:12px;color:#333">ブックマークに保存された投稿から動画と画像を保存します。</p>
+        <button id="save-all-visible">まとめて保存</button>
+        <label class="action-option" for="bulk-save-mode">保存モード</label>
+        <select id="bulk-save-mode">
+          <option value="bookmarks" selected>ブックマークから保存</option>
+          <option value="account">個別アカウントからの保存</option>
+        </select>
+        <p id="bulk-save-description" style="margin:0;font-size:12px;color:#333">ブックマークに保存された投稿から動画と画像を保存します。</p>
         <label class="action-option">
           <input id="check-all-saved-list" type="checkbox" checked disabled />
           メディアIDで保存済みを確認（常に有効）
