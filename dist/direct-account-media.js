@@ -20,7 +20,10 @@ export function accountMediaTarget(raw) {
         throw new Error('保存したいアカウントのページを開いてください。');
     const handle = match[1].toLowerCase();
     const photoOnly = mediaPage && filter === 'photo';
-    return { handle, photoOnly, url: `${ACCOUNT_ORIGIN}/${handle}/media${photoOnly ? '?filter=photo' : ''}` };
+    return { handle, photoOnly, mediaType: photoOnly ? 'images' : 'all', url: `${ACCOUNT_ORIGIN}/${handle}/media${photoOnly ? '?filter=photo' : ''}` };
+}
+function accountScope(target, loginScope, userId) {
+    return JSON.stringify([target.url, 'UserMedia', JSON.parse(loginScope)[2], userId, target.mediaType]);
 }
 function accountOperation(raw) {
     try {
@@ -35,8 +38,8 @@ function accountOperation(raw) {
 }
 export function assertAccountMediaScope(url, scope) {
     try {
-        const [target, kind, login, userId] = JSON.parse(scope);
-        if (accountMediaTarget(url).url === url && target === url && kind === 'UserMedia' && typeof login === 'string' && /^\d+:/.test(login) && /^\d+$/.test(userId))
+        const [target, kind, login, userId, mediaType] = JSON.parse(scope);
+        if (accountMediaTarget(url).url === url && target === url && kind === 'UserMedia' && typeof login === 'string' && /^\d+:/.test(login) && /^\d+$/.test(userId) && (mediaType === undefined || ['all', 'images', 'videos'].includes(mediaType)) && (mediaType === undefined || (mediaType === 'images') === accountMediaTarget(url).photoOnly))
             return;
     }
     catch { /* Unknown targets never authorize account media downloads. */ }
@@ -229,7 +232,7 @@ export class DirectAccountMedia {
         const owner = stored?.loginScope === loginScope && stored.owner?.handle === target.handle ? stored.owner : undefined;
         const template = await this.template(storeId, loginScope, target, !owner, client);
         if (owner) {
-            const scope = JSON.stringify([target.url, 'UserMedia', JSON.parse(loginScope)[2], owner.userId]);
+            const scope = accountScope(target, loginScope, owner.userId);
             return { scope, page: await this.fetchPage(storeId, scope, template) };
         }
         const variables = { ...template.lookup.variables, screen_name: target.handle };
@@ -238,7 +241,7 @@ export class DirectAccountMedia {
         const handle = user?.legacy?.screen_name ?? user?.core?.screen_name;
         if (typeof user?.rest_id !== 'string' || !/^\d+$/.test(user.rest_id) || (handle && String(handle).toLowerCase() !== target.handle))
             throw new Error('対象アカウントを特定できません。非公開・削除・アクセス不能の可能性があります。');
-        const scope = JSON.stringify([target.url, 'UserMedia', JSON.parse(loginScope)[2], user.rest_id]);
+        const scope = accountScope(target, loginScope, user.rest_id);
         await chrome.storage.session.set({ [this.key(storeId, target.photoOnly)]: { ...template, owner: { handle: target.handle, userId: user.rest_id } } });
         return { scope, page: await this.fetchPage(storeId, scope, template) };
     }
@@ -256,7 +259,7 @@ export class DirectAccountMedia {
         const route = result.request;
         if (accountOperation(route.url) !== 'UserMedia' || !['GET', 'POST'].includes(route.method ?? 'GET') || route.variables?.userId !== result.userId || route.variables.cursor)
             throw new Error('アカウントの先頭メディア応答を確認できません。');
-        const page = parseAccountMediaPage(result.data, result.userId, target.photoOnly);
+        const page = parseAccountMediaPage(result.data, result.userId, target.photoOnly, undefined, target.mediaType === 'videos');
         await this.captures;
         await directBookmarks.check(storeId, loginScope);
         const key = this.key(storeId, target.photoOnly);
@@ -264,7 +267,7 @@ export class DirectAccountMedia {
         const shared = await directBookmarks.clientSession(storeId, loginScope);
         const authorization = (stored?.loginScope === loginScope ? stored.authorization : '') || shared.authorization || '';
         await chrome.storage.session.set({ [key]: { ...(stored?.loginScope === loginScope ? stored : {}), loginScope, authorization, at: Date.now(), lastTabId: tabId, media: route, owner: { handle: target.handle, userId: result.userId } } });
-        return { scope: JSON.stringify([target.url, 'UserMedia', JSON.parse(loginScope)[2], result.userId]), page };
+        return { scope: accountScope(target, loginScope, result.userId), page };
     }
     async cleanup() {
         const owned = (await chrome.storage.session.get(ACCOUNT_BOOTSTRAP_KEY))[ACCOUNT_BOOTSTRAP_KEY];
@@ -355,17 +358,25 @@ export class DirectAccountMedia {
         }
         await chrome.storage.session.remove(ACCOUNT_BOOTSTRAP_KEY);
     }
-    async prepare(tabId) {
+    async prepare(tabId, mediaTypes) {
+        if (mediaTypes !== undefined && (!mediaTypes || typeof mediaTypes !== 'object' || typeof mediaTypes.images !== 'boolean' || typeof mediaTypes.videos !== 'boolean' || (!mediaTypes.images && !mediaTypes.videos)))
+            throw new Error('動画または画像を選択してください。');
         await this.recovery;
         await this.cleanup();
         const tab = await chrome.tabs.get(tabId);
         const target = accountMediaTarget(tab.url ?? '');
+        if (mediaTypes !== undefined) {
+            const selected = mediaTypes;
+            target.mediaType = selected.images ? selected.videos ? 'all' : 'images' : 'videos';
+            target.photoOnly = target.mediaType === 'images';
+            target.url = `${ACCOUNT_ORIGIN}/${target.handle}/media${target.photoOnly ? '?filter=photo' : ''}`;
+        }
         const identity = await directBookmarks.login(tabId);
         let initial;
         const stored = (await chrome.storage.session.get(this.key(identity.storeId, target.photoOnly)))[this.key(identity.storeId, target.photoOnly)];
         const knownOwner = stored?.loginScope === identity.scope && stored.owner?.handle === target.handle;
         try {
-            const native = !knownOwner && /^\/[^/]+\/media\/?$/.test(new URL(tab.url).pathname) ? await this.nativeFirst(tabId, identity.storeId, identity.scope, target) : undefined;
+            const native = !knownOwner && accountMediaTarget(tab.url).url === target.url && /^\/[^/]+\/media\/?$/.test(new URL(tab.url).pathname) ? await this.nativeFirst(tabId, identity.storeId, identity.scope, target) : undefined;
             initial = native ?? await this.first(identity.storeId, identity.scope, target, await this.clientConfig(tabId, target));
         }
         catch (error) {
@@ -405,8 +416,10 @@ export class DirectAccountMedia {
     }
     async fetchPage(storeId, scope, supplied, cursor) {
         await this.check(storeId, scope);
-        const [url, , login, userId] = JSON.parse(scope);
+        const [url, , login, userId, mediaType] = JSON.parse(scope);
         const target = accountMediaTarget(url);
+        if (mediaType)
+            target.mediaType = mediaType;
         const loginScope = JSON.stringify([ACCOUNT_ORIGIN + '/i/bookmarks', 'Bookmarks', login]);
         const template = supplied ?? await this.template(storeId, loginScope, target, false);
         const variables = { ...template.media.variables, userId, count: 20, includePromotedContent: false };
@@ -418,7 +431,7 @@ export class DirectAccountMedia {
         const returnedHandle = body?.data?.user?.result?.core?.screen_name ?? body?.data?.user?.result?.legacy?.screen_name;
         if (returnedHandle !== undefined && (typeof returnedHandle !== 'string' || returnedHandle.toLowerCase() !== target.handle))
             throw new AccountMediaResponseError('取得したメディア一覧のアカウント名が対象と一致しません。');
-        return parseAccountMediaPage(body, userId, target.photoOnly, variables.userId);
+        return parseAccountMediaPage(body, userId, target.photoOnly, variables.userId, target.mediaType === 'videos');
     }
 }
 export const directAccountMedia = new DirectAccountMedia();

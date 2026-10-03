@@ -75,6 +75,77 @@ test('page limit reports partial acquisition and retains cursor for resume', asy
   const result = await h.done(); assert.equal(result.job.endedBy, 'max-rounds'); assert.equal(result.job.status, 'review'); assert.equal(result.job.cursor, 'next');
   h.pages.push(page(['B'])); await h.request({ type: 'RESUME_SAVE' }); const resumed = await h.done(); assert.equal(resumed.stats.success, 2);
 });
+test('twenty-page bookmark batches resume at page 21 and 41 with cumulative progress', async () => {
+  const h = harness();
+  for (let n = 1; n <= 41; n++) h.pages.push(page(['PAGE_' + n], n < 41 ? 'after-' + n : undefined));
+  assert.equal((await h.request({ type: 'SAVE_ALL_VISIBLE_IMAGES', tabId: 1, scrollSettings: { maxRounds: 20 } })).ok, true);
+  let result = await h.done();
+  assert.equal(result.job.rounds, 20); assert.equal(result.job.cursor, 'after-20');
+  h.chrome.tabs.get = async () => { throw new Error('Original tab closed'); };
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true);
+  result = await h.done();
+  assert.equal(result.job.rounds, 40); assert.equal(result.job.cursor, 'after-40'); assert.equal(result.job.endedBy, 'max-rounds');
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true);
+  result = await h.done(); assert.equal(result.job.rounds, 41); assert.equal(result.stats.success, 41);
+  const cursors = h.directRequests.filter(row => row.url.includes('/graphql/')).map(row => JSON.parse(new URL(row.url).searchParams.get('variables')).cursor);
+  assert.equal(cursors.length, 41); assert.equal(cursors[20], 'after-20'); assert.equal(cursors[40], 'after-40');
+  assert.equal(cursors.filter(cursor => cursor === undefined).length, 1);
+  assert.equal(h.createdTabs.length, 0);
+});
+test('bookmark resume keeps the persisted page-20 cursor after a worker restart', async () => {
+  const first = harness();
+  for (let n = 1; n <= 20; n++) first.pages.push(page(['PAGE_' + n], 'after-' + n));
+  await start(first); await first.done();
+  const h = harness(first.store); h.pages.push(page(['PAGE_21']));
+  await h.done();
+  h.chrome.tabs.get = async () => { throw new Error('Original tab closed'); };
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true);
+  const result = await h.done(); assert.equal(result.job.rounds, 21); assert.equal(result.stats.success, 21);
+  const request = h.directRequests.find(row => row.url.includes('/graphql/'));
+  assert.equal(JSON.parse(new URL(request.url).searchParams.get('variables')).cursor, 'after-20');
+  assert.equal(h.calls.length, 1);
+});
+test('worker recovery retains the page allowance of the current resumed batch', async () => {
+  const first = harness();
+  for (let n = 1; n <= 20; n++) first.pages.push(page([], 'after-' + n));
+  await start(first); await first.done();
+  first.store.imageSaveJob.status = 'running'; first.store.imageSaveJob.sourceDone = false;
+  first.store.imageSaveJob.roundStart = 20; first.store.imageSaveJob.endedBy = '';
+  const h = harness(first.store);
+  for (let n = 21; n <= 45; n++) h.pages.push(page([], 'after-' + n));
+  const result = await h.done(); assert.equal(result.job.rounds, 40); assert.equal(result.job.cursor, 'after-40');
+  assert.equal(result.job.endedBy, 'max-rounds'); assert.equal(h.pages.length, 5);
+});
+test('missing continuation cursor pauses without erasing the previous retry position', async () => {
+  const h = harness(); const broken = page(['PARTIAL']);
+  broken.data.bookmark_timeline_v2.timeline.instructions.push({ type: 'UnknownInstruction' });
+  h.pages.push(page(['A'], 'next'), broken);
+  await start(h); const stopped = await h.done();
+  assert.equal(stopped.job.cursor, 'next'); assert.equal(stopped.job.rounds, 1); assert.equal(stopped.job.status, 'paused');
+  h.pages.push(page(['PARTIAL', 'B']));
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true); await h.done();
+  const cursors = h.directRequests.filter(row => row.url.includes('/graphql/')).map(row => JSON.parse(new URL(row.url).searchParams.get('variables')).cursor);
+  assert.deepEqual(cursors, [undefined, 'next', 'next']); assert.equal(h.calls.length, 3);
+});
+test('legacy partial job without a cursor never silently resumes from the head', async () => {
+  const first = harness(); first.pages.push(page(['A'], 'next'));
+  await first.request({ type: 'SAVE_ALL_VISIBLE_IMAGES', tabId: 1, scrollSettings: { maxRounds: 1 } }); await first.done();
+  delete first.store.imageSaveJob.cursor;
+  const h = harness(first.store);
+  await h.done();
+  const result = await h.request({ type: 'RESUME_SAVE' });
+  assert.equal(result.ok, false); assert.match(result.error, /続きの取得位置/);
+  assert.equal(h.directRequests.length, 0); assert.equal(h.calls.length, 0);
+});
+test('retrying downloads after timeline end never fetches the head again', async () => {
+  const h = harness(); h.pages.push(page(['A'])); await start(h); await h.done();
+  const count = h.directRequests.length;
+  for (let n = 0; n < 2; n++) {
+    assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true);
+    const result = await h.done(); assert.equal(result.job.endedBy, 'timeline-end'); assert.equal(result.job.status, 'done');
+  }
+  assert.equal(h.directRequests.length, count); assert.equal(h.calls.length, 1);
+});
 test('new head start preserves failed work instead of discarding it', async () => {
   const h = harness(); h.snap.urls = [url('A')];
   const download = h.chrome.downloads.download;

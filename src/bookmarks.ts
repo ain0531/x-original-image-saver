@@ -16,7 +16,7 @@ export function parseBookmarkPage(body: any): BookmarkPage {
   return parseTimelineMedia(instructions, true);
 }
 export class AccountMediaResponseError extends Error {}
-export function parseAccountMediaPage(body: any, userId: string, photoOnly: boolean, requestedUserId?: string): BookmarkPage {
+export function parseAccountMediaPage(body: any, userId: string, photoOnly: boolean, requestedUserId?: string, videoOnly = false): BookmarkPage {
   if (body?.errors?.length) throw new AccountMediaResponseError('Xがメディア一覧の取得エラーを返しました。取得位置は保持しています。');
   const user = body?.data?.user?.result;
   if (!user || typeof user !== 'object' || (user.__typename && user.__typename !== 'User')) throw new AccountMediaResponseError('アカウントのメディア一覧を取得できませんでした。ユーザー応答が空または取得不能です。');
@@ -27,9 +27,9 @@ export function parseAccountMediaPage(body: any, userId: string, photoOnly: bool
   if (user.rest_id === undefined && requestedUserId !== userId) throw new AccountMediaResponseError('メディア応答にアカウントIDがなく、取得要求の対象も確認できません。');
   const instructions = user.timeline_v2?.timeline?.instructions ?? user.timeline?.timeline?.instructions;
   if (!Array.isArray(instructions)) throw new AccountMediaResponseError('アカウントのメディア一覧の応答形式を認識できません。');
-  return parseTimelineMedia(instructions, false, photoOnly);
+  return parseTimelineMedia(instructions, false, photoOnly, videoOnly);
 }
-function parseTimelineMedia(instructions: any[], includeQuotes: boolean, photoOnly = false): BookmarkPage {
+function parseTimelineMedia(instructions: any[], includeQuotes: boolean, photoOnly = false, videoOnly = false): BookmarkPage {
   const media = new Map<string, Media>();
   const issues: string[] = [];
   let cursor: string | undefined;
@@ -47,6 +47,7 @@ function parseTimelineMedia(instructions: any[], includeQuotes: boolean, photoOn
     if (!full.length && list.length) issues.push(`投稿 ${id}: 全画像・動画の一覧がなく、複数ファイルの確認ができません。`);
     for (const item of list) {
       if (photoOnly && ['video', 'animated_gif'].includes(item.type)) continue;
+      if (videoOnly && item.type === 'photo') continue;
       const parsed = tweetMedia(item);
       if (parsed.media) media.set(mediaKey(parsed.media), parsed.media);
       if (parsed.issue) issues.push(`投稿 ${id}: ${parsed.issue}`);

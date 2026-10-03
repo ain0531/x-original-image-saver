@@ -24,7 +24,7 @@ export function parseBookmarkPage(body) {
 }
 export class AccountMediaResponseError extends Error {
 }
-export function parseAccountMediaPage(body, userId, photoOnly, requestedUserId) {
+export function parseAccountMediaPage(body, userId, photoOnly, requestedUserId, videoOnly = false) {
     if (body?.errors?.length)
         throw new AccountMediaResponseError('Xがメディア一覧の取得エラーを返しました。取得位置は保持しています。');
     const user = body?.data?.user?.result;
@@ -41,9 +41,9 @@ export function parseAccountMediaPage(body, userId, photoOnly, requestedUserId) 
     const instructions = user.timeline_v2?.timeline?.instructions ?? user.timeline?.timeline?.instructions;
     if (!Array.isArray(instructions))
         throw new AccountMediaResponseError('アカウントのメディア一覧の応答形式を認識できません。');
-    return parseTimelineMedia(instructions, false, photoOnly);
+    return parseTimelineMedia(instructions, false, photoOnly, videoOnly);
 }
-function parseTimelineMedia(instructions, includeQuotes, photoOnly = false) {
+function parseTimelineMedia(instructions, includeQuotes, photoOnly = false, videoOnly = false) {
     const media = new Map();
     const issues = [];
     let cursor;
@@ -67,6 +67,8 @@ function parseTimelineMedia(instructions, includeQuotes, photoOnly = false) {
             issues.push(`投稿 ${id}: 全画像・動画の一覧がなく、複数ファイルの確認ができません。`);
         for (const item of list) {
             if (photoOnly && ['video', 'animated_gif'].includes(item.type))
+                continue;
+            if (videoOnly && item.type === 'photo')
                 continue;
             const parsed = tweetMedia(item);
             if (parsed.media)

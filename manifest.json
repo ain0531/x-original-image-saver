@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "X 原寸画像保存",
-  "version": "0.5.5",
+  "version": "0.5.7",
   "description": "Xの投稿画像を原寸、動画を取得可能な最高ビットレートのMP4で保存します。",
   "permissions": [
     "activeTab",

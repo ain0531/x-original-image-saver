@@ -5,7 +5,12 @@ if (versionElement)
 const saveCurrentTweetButton = document.getElementById("save-current-tweet");
 const saveAllVisibleButton = document.getElementById("save-all-visible");
 const bulkModeInput = document.getElementById('bulk-save-mode');
+const accountVideosInput = document.getElementById('account-save-videos');
+const accountImagesInput = document.getElementById('account-save-images');
 function describeBulkMode() {
+    const mediaTypes = document.getElementById('account-media-types');
+    if (mediaTypes)
+        mediaTypes.hidden = bulkModeInput?.value !== 'account';
     const description = document.getElementById('bulk-save-description');
     if (description)
         description.textContent = bulkModeInput?.value === 'account'
@@ -61,6 +66,10 @@ async function getSavedMediaCount() {
 async function initializeSidePanel() {
     if (bulkModeInput)
         bulkModeInput.value = 'bookmarks';
+    if (accountVideosInput)
+        accountVideosInput.checked = true;
+    if (accountImagesInput)
+        accountImagesInput.checked = true;
     describeBulkMode();
     const stored = await chrome.storage.local.get(['imageSaverOptions', 'likeOnSave', 'specifySaveLocation']);
     if (specifySaveLocationInput)
@@ -98,6 +107,11 @@ bindAction(saveCurrentTweetButton, async () => {
 });
 bindAction(saveAllVisibleButton, async () => {
     const accountMode = bulkModeInput?.value === 'account';
+    const mediaTypes = { videos: accountVideosInput?.checked ?? true, images: accountImagesInput?.checked ?? true };
+    if (accountMode && !mediaTypes.videos && !mediaTypes.images) {
+        setStatus('動画または画像を選択してください。');
+        return;
+    }
     const activeTab = await getActiveTab();
     if (!activeTab?.id) {
         setStatus("開いているタブを確認できません。");
@@ -106,6 +120,7 @@ bindAction(saveAllVisibleButton, async () => {
     setStatus(accountMode ? 'アカウントのメディア一覧を取得しています。必要な場合は取得用タブを一時的に開き、通信後に自動で閉じます...' : "ブックマークの初回データを取得しています。必要な場合は取得用タブを一時的に開き、通信後に自動で閉じます...");
     const response = (await chrome.runtime.sendMessage({
         type: accountMode ? 'SAVE_ACCOUNT_MEDIA' : "SAVE_ALL_VISIBLE_IMAGES",
+        ...(accountMode ? { mediaTypes } : {}),
         tabId: activeTab.id,
         tabUrl: activeTab.url ?? "",
         saveAs: false,

@@ -111,6 +111,10 @@ export class SaveJobs {
                 throw new Error('再開できる処理がありません。');
             if (this.job.status === 'running' || this.running)
                 throw new Error('処理中です。停止処理が完了してから再開してください。');
+            const paginated = ['network', 'direct', 'account'].includes(this.job.source);
+            const timelineEnded = this.job.timelineEnded === true || this.job.endedBy === 'timeline-end';
+            if (paginated && !timelineEnded && this.job.rounds > 0 && !this.job.cursor)
+                throw new Error('続きの取得位置が保存されていません。先頭からの自動再取得を停止しました。「まとめて保存」で新しく開始してください。');
             this.job.skip = true;
             if (this.job.source === 'direct')
                 await directBookmarks.check(this.job.cookieStoreId, this.job.scope);
@@ -132,11 +136,11 @@ export class SaveJobs {
                     task.error = undefined;
                     await this.taskWrite(task);
                 }
-            if (this.job.endedBy !== 'timeline-end' && ['network', 'direct', 'account'].includes(this.job.source))
-                this.job.sourceDone = false;
-            this.job.rounds = 0;
+            if (paginated)
+                this.job.sourceDone = timelineEnded;
+            this.job.roundStart = this.job.rounds;
             this.job.status = 'running';
-            this.job.endedBy = '';
+            this.job.endedBy = timelineEnded ? 'timeline-end' : '';
             await this.persist();
             this.kick();
             return this.status();
@@ -156,7 +160,7 @@ export class SaveJobs {
             throw new Error('Xのページを開いてください。');
         const preferences = await getOptions();
         const accountMode = message.type === 'SAVE_ACCOUNT_MEDIA';
-        const target = current ? undefined : accountMode ? await directAccountMedia.prepare(message.tabId) : await directBookmarks.prepare(message.tabId);
+        const target = current ? undefined : accountMode ? await directAccountMedia.prepare(message.tabId, message.mediaTypes) : await directBookmarks.prepare(message.tabId);
         const tabId = message.tabId;
         const requestedPost = current && typeof message.postId === 'string' && /^\d+$/.test(message.postId) ? message.postId : undefined;
         const snap = target ? { pageUrl: target.url ?? 'https://x.com/i/bookmarks', scope: target.scope, documentId: 0, urls: [], posts: [], issues: [], loading: false, bottom: false, y: 0 } : await snapshot(tabId, true, requestedPost);
@@ -284,12 +288,14 @@ export class SaveJobs {
             }
         })());
         const startedAt = Date.now();
+        // Keep the cumulative page count, with a durable allowance for this run.
+        const roundStart = job.roundStart ?? 0;
         let sourceError;
         try {
             while (job.status === 'running' && !job.sourceDone) {
-                if (job.rounds >= job.settings.maxRounds || Date.now() - startedAt >= job.settings.maxElapsedMs) {
+                if (job.rounds - roundStart >= job.settings.maxRounds || Date.now() - startedAt >= job.settings.maxElapsedMs) {
                     job.sourceDone = true;
-                    job.endedBy = job.rounds >= job.settings.maxRounds ? 'max-rounds' : 'max-time';
+                    job.endedBy = job.rounds - roundStart >= job.settings.maxRounds ? 'max-rounds' : 'max-time';
                     await this.persist();
                     break;
                 }
@@ -308,14 +314,16 @@ export class SaveJobs {
                     await this.enqueue(page); // Durable image queue first, cursor second.
                     if (page.cursor && page.cursor === job.cursor)
                         throw new Error('同じ取得位置が返されました。末尾とは判定せず停止しました。');
+                    // An incomplete response must not erase the position used to retry it.
+                    if (!page.ended && !page.cursor)
+                        throw new Error('次の取得位置が不明です。取得位置と未処理画像を保持して停止しました。');
                     job.cursor = page.cursor;
                     job.rounds++;
                     if (page.ended) {
+                        job.timelineEnded = true;
                         job.sourceDone = true;
                         job.endedBy = 'timeline-end';
                     }
-                    else if (!page.cursor)
-                        throw new Error('次の取得位置が不明です。未処理画像を保持して停止しました。');
                     await this.persist();
                 }
                 else {

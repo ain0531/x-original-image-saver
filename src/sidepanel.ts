@@ -28,7 +28,11 @@ const saveAllVisibleButton = document.getElementById(
   "save-all-visible"
 ) as HTMLButtonElement | null;
 const bulkModeInput = document.getElementById('bulk-save-mode') as HTMLSelectElement | null;
+const accountVideosInput = document.getElementById('account-save-videos') as HTMLInputElement | null;
+const accountImagesInput = document.getElementById('account-save-images') as HTMLInputElement | null;
 function describeBulkMode(): void {
+  const mediaTypes = document.getElementById('account-media-types');
+  if (mediaTypes) mediaTypes.hidden = bulkModeInput?.value !== 'account';
   const description = document.getElementById('bulk-save-description');
   if (description) description.textContent = bulkModeInput?.value === 'account'
     ? '現在開いているアカウントのメディアを保存します。'
@@ -97,6 +101,8 @@ async function getSavedMediaCount(): Promise<number> {
 }
 async function initializeSidePanel(): Promise<void> {
   if (bulkModeInput) bulkModeInput.value = 'bookmarks';
+  if (accountVideosInput) accountVideosInput.checked = true;
+  if (accountImagesInput) accountImagesInput.checked = true;
   describeBulkMode();
   const stored = await chrome.storage.local.get(['imageSaverOptions', 'likeOnSave', 'specifySaveLocation']);
   if (specifySaveLocationInput) specifySaveLocationInput.checked = stored.specifySaveLocation === true;
@@ -141,6 +147,8 @@ bindAction(saveCurrentTweetButton, async () => {
 
 bindAction(saveAllVisibleButton, async () => {
   const accountMode = bulkModeInput?.value === 'account';
+  const mediaTypes = { videos: accountVideosInput?.checked ?? true, images: accountImagesInput?.checked ?? true };
+  if (accountMode && !mediaTypes.videos && !mediaTypes.images) { setStatus('動画または画像を選択してください。'); return; }
   const activeTab = await getActiveTab();
 
   if (!activeTab?.id) {
@@ -153,6 +161,7 @@ bindAction(saveAllVisibleButton, async () => {
 
   const response = (await chrome.runtime.sendMessage({
     type: accountMode ? 'SAVE_ACCOUNT_MEDIA' : "SAVE_ALL_VISIBLE_IMAGES",
+    ...(accountMode ? { mediaTypes } : {}),
     tabId: activeTab.id,
     tabUrl: activeTab.url ?? "",
     saveAs: false,

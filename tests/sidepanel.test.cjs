@@ -147,3 +147,19 @@ test('bulk save defaults to bookmarks and routes the selected account mode with 
   h.elements.get('save-all-visible').click(); await flush(); assert.equal(h.messages[1].type, 'SAVE_ACCOUNT_MEDIA');
   assert.equal(h.messages[1].saveAs, false);
 });
+
+test('account media checkboxes select either or both types and block an empty selection', async () => {
+  const h = harness(); await flush();
+  const group = h.elements.get('account-media-types'), mode = h.elements.get('bulk-save-mode');
+  assert.equal(group.hidden, true); mode.value = 'account'; mode.change(); assert.equal(group.hidden, false);
+  const videos = h.elements.get('account-save-videos'), images = h.elements.get('account-save-images');
+  assert.equal(videos.checked, true); assert.equal(images.checked, true);
+  for (const [video, image] of [[true, true], [true, false], [false, true]]) {
+    videos.checked = video; images.checked = image; h.elements.get('save-all-visible').click(); await flush();
+    const sent = h.messages.at(-1); assert.equal(sent.mediaTypes.videos, video); assert.equal(sent.mediaTypes.images, image);
+  }
+  videos.checked = false; images.checked = false; h.elements.get('save-all-visible').click(); await flush();
+  assert.equal(h.messages.length, 3); assert.match(h.elements.get('status').textContent, /動画または画像を選択/);
+  mode.value = 'bookmarks'; mode.change(); h.elements.get('save-all-visible').click(); await flush();
+  assert.equal(group.hidden, true); assert.equal(h.messages[3].type, 'SAVE_ALL_VISIBLE_IMAGES'); assert.equal(h.messages[3].mediaTypes, undefined);
+});

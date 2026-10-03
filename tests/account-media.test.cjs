@@ -5,8 +5,43 @@ const startAccount = h => h.request({ type: 'SAVE_ACCOUNT_MEDIA', tabId: 1 });
 function accountPage(ids = [], cursor, userId = '42') {
   return { data: { user: { result: { rest_id: userId, timeline_v2: { timeline: page(ids, cursor).data.bookmark_timeline_v2.timeline } } } } };
 }
-function fixture({ photoOnly = false, observe = true } = {}) {
-  const h = harness(); h.snap.pageUrl = 'https://x.com/alice/media' + (photoOnly ? '?filter=photo' : '');
+function mixedPage(cursor) {
+  const body = accountPage(['PHOTO'], cursor);
+  body.data.user.result.timeline_v2.timeline.instructions[0].entries[0].content.itemContent.tweet_results.result.legacy.extended_entities.media.push(
+    { type: 'video', id_str: '123', video_info: { variants: [{ bitrate: 20, content_type: 'video/mp4', url: 'https://video.twimg.com/ext_tw_video/123/pu/vid/high.mp4' }] } },
+    { type: 'animated_gif', id_str: '456', video_info: { variants: [{ content_type: 'video/mp4', url: 'https://video.twimg.com/tweet_video/GIF.mp4' }] } });
+  return body;
+}
+
+for (const mediaTypes of [{ images: true, videos: false }, { images: false, videos: true }, { images: true, videos: true }]) test(`account media type selection images=${mediaTypes.images} videos=${mediaTypes.videos} overrides the current page filter`, async () => {
+  const { h, accountPages, bootstrap } = fixture({ photoOnly: true }); accountPages.push(mixedPage());
+  if (mediaTypes.videos) bootstrap();
+  const start = await h.request({ type: 'SAVE_ACCOUNT_MEDIA', tabId: 1, mediaTypes }); assert.equal(start.ok, true, start.error);
+  const done = await h.done(); assert.equal(done.stats.success, Number(mediaTypes.images) + Number(mediaTypes.videos) * 2);
+  assert.equal(done.job.url, 'https://x.com/alice/media' + (mediaTypes.images && !mediaTypes.videos ? '?filter=photo' : ''));
+  assert.equal(h.calls.some(row => row.url.includes('PHOTO')), mediaTypes.images);
+  assert.equal(h.calls.some(row => row.url.includes('high.mp4')), mediaTypes.videos);
+  assert.equal(h.calls.some(row => row.url.includes('GIF.mp4')), mediaTypes.videos);
+});
+
+test('video-only continuation keeps its type selection when the source tab is closed', async () => {
+  const { h, accountPages } = fixture(); accountPages.push(mixedPage('next'), mixedPage());
+  const start = await h.request({ type: 'SAVE_ACCOUNT_MEDIA', tabId: 1, mediaTypes: { images: false, videos: true }, scrollSettings: { maxRounds: 1 } });
+  assert.equal(start.ok, true, start.error); const first = await h.done(); assert.equal(first.job.cursor, 'next');
+  h.chrome.tabs.get = async () => { throw new Error('Closed'); };
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true); const done = await h.done();
+  assert.equal(done.stats.success, 2); assert.ok(h.calls.every(row => row.url.startsWith('https://video.twimg.com/')));
+  assert.equal(JSON.parse(done.job.scope)[4], 'videos');
+});
+
+test('invalid or empty account type selection fails before any request or tab', async () => {
+  for (const mediaTypes of [null, {}, { images: false, videos: false }, { images: 'true', videos: false }]) {
+    const { h } = fixture(); const start = await h.request({ type: 'SAVE_ACCOUNT_MEDIA', tabId: 1, mediaTypes });
+    assert.equal(start.ok, false); assert.match(start.error, /動画または画像/); assert.equal(h.directRequests.length, 0); assert.equal(h.createdTabs.length, 0); assert.equal(h.calls.length, 0);
+  }
+});
+function fixture({ photoOnly = false, observe = true, initial = {} } = {}) {
+  const h = harness(initial); h.snap.pageUrl = 'https://x.com/alice/media' + (photoOnly ? '?filter=photo' : '');
   h.snap.urls = ['https://pbs.twimg.com/media/WRONG_DOM.jpg'];
   const requests = [], accountPages = [];
   const fetch = h.context.fetch;
@@ -177,6 +212,36 @@ test('account page limit retains its cursor and resumes after the original tab c
   assert.equal((await h.done()).stats.success, 2);
   assert.equal(requests.filter(row => row.operation === 'UserMedia')[1].variables.cursor, 'next');
   h.auth = 'different-account'; assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, false);
+});
+test('account batches resume at page 21 and 41 without head lookup or reset progress', async () => {
+  const { h, requests, accountPages } = fixture();
+  for (let n = 1; n <= 41; n++) accountPages.push(accountPage(['PAGE_' + n], n < 41 ? 'after-' + n : undefined));
+  await h.request({ type: 'SAVE_ACCOUNT_MEDIA', tabId: 1, scrollSettings: { maxRounds: 20 } });
+  let result = await h.done(); assert.equal(result.job.rounds, 20); assert.equal(result.job.cursor, 'after-20');
+  h.chrome.tabs.get = async () => { throw new Error('Original tab closed'); };
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true);
+  result = await h.done(); assert.equal(result.job.rounds, 40); assert.equal(result.job.cursor, 'after-40'); assert.equal(result.job.endedBy, 'max-rounds');
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true);
+  result = await h.done(); assert.equal(result.job.rounds, 41); assert.equal(result.stats.success, 41);
+  const media = requests.filter(row => row.operation === 'UserMedia');
+  assert.equal(media.length, 41); assert.equal(media[20].variables.cursor, 'after-20'); assert.equal(media[40].variables.cursor, 'after-40');
+  assert.equal(media.filter(row => !row.variables.cursor).length, 1);
+  assert.equal(requests.filter(row => row.operation === 'UserByScreenName').length, 1);
+  assert.equal(h.createdTabs.length, 0);
+});
+test('account resume uses page-20 durable position after a worker restart', async () => {
+  const first = fixture();
+  for (let n = 1; n <= 20; n++) first.accountPages.push(accountPage(['PAGE_' + n], 'after-' + n));
+  await startAccount(first.h); await first.h.done();
+  const { h, requests, accountPages } = fixture({ initial: first.h.store });
+  Object.assign(h.session, structuredClone(first.h.session)); // storage.session survives worker restarts.
+  await h.done();
+  accountPages.push(accountPage(['PAGE_21']));
+  h.chrome.tabs.get = async () => { throw new Error('Original tab closed'); };
+  assert.equal((await h.request({ type: 'RESUME_SAVE' })).ok, true);
+  const result = await h.done(); assert.equal(result.job.rounds, 21, result.job.endedBy); assert.equal(result.stats.success, 21);
+  const media = requests.filter(row => row.operation === 'UserMedia');
+  assert.equal(media.length, 1); assert.equal(media[0].variables.cursor, 'after-20'); assert.equal(h.calls.length, 1);
 });
 
 test('rate limits and login changes stop account preparation without downloading or opening tabs', async () => {
