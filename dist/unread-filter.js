@@ -181,6 +181,18 @@
             releaseReadHere(root);
     }
     function releaseReadHere(root) {
+        // Posts on screen stay in X's list (removing them would move what is shown); the rest are
+        // dropped from it on the next timeline response so X no longer redraws them.
+        const shown = new Set();
+        for (const article of Array.from(root.querySelectorAll('article'))) {
+            const id = evaluated.get(article);
+            const box = cellOf(article).getBoundingClientRect();
+            if (id && box.bottom > 0 && box.top < innerHeight)
+                shown.add(id);
+        }
+        const release = Array.from(readHere).filter(id => !shown.has(id));
+        if (release.length)
+            bridge({ release });
         readHere.clear();
         for (const article of Array.from(root.querySelectorAll('article'))) {
             const id = evaluated.get(article);
