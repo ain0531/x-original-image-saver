@@ -1,7 +1,9 @@
 "use strict";
 // Runs in the page's MAIN world. Removes read posts from X's home timeline responses before
 // X renders them, so hiding never happens inside the visible area. The read list arrives from
-// the isolated unread-filter script through window.postMessage.
+// the isolated unread-filter script through window.postMessage. Posts read on this page that are
+// released on returning to the top are removed from X's own list with TimelineRemoveEntries on the
+// next timeline response, so X stops redrawing them (hiding them one by one stalled scrolling).
 (() => {
     const host = window;
     if (host.__xOriginalTimelineFilter)
@@ -20,6 +22,10 @@
     let enabled = false;
     let received = false;
     const read = new Set();
+    const released = new Set();
+    // Entries X has received: entry ID -> post IDs of each post in it (a repost also by its original).
+    const delivered = new Map();
+    const MAX_DELIVERED = 5000;
     let markReady = () => { };
     const ready = new Promise(resolve => { markReady = resolve; });
     window.addEventListener('message', event => {
@@ -29,9 +35,16 @@
         received = true;
         if (typeof data.enabled === 'boolean') {
             enabled = data.enabled;
-            if (!enabled)
+            if (!enabled) {
                 read.clear();
+                released.clear();
+                delivered.clear();
+            }
         }
+        if (Array.isArray(data.release))
+            for (const id of data.release)
+                if (typeof id === 'string' && /^\d+$/.test(id))
+                    released.add(id);
         if (Array.isArray(data.ids))
             for (const id of data.ids)
                 if (typeof id === 'string' && /^\d+$/.test(id))
@@ -49,13 +62,12 @@
     };
     const tweet = (result) => result?.__typename === 'TweetWithVisibilityResults' ? result.tweet : result;
     // The DOM records a repost under the original post's ID, so check both.
-    const isRead = (content) => {
+    const postIds = (content) => {
         const result = tweet(content?.itemContent?.tweet_results?.result);
-        if (!result)
-            return false;
-        const original = tweet(result.legacy?.retweeted_status_result?.result);
-        return read.has(result.rest_id) || (!!original && read.has(original.rest_id));
+        const original = tweet(result?.legacy?.retweeted_status_result?.result);
+        return [result?.rest_id, original?.rest_id].filter((id) => typeof id === 'string');
     };
+    const isRead = (content) => postIds(content).some(id => read.has(id));
     // Returns the number of removed entries. Entries are removed whole: X keeps the post IDs of
     // a conversation module in its metadata, so a module is dropped only when every post is read.
     // A page is never emptied of posts, or X stops loading; its last read entry is kept instead.
@@ -65,6 +77,15 @@
             return 0;
         let removed = 0, kept = 0;
         let lastRemoved;
+        // Released entries X already holds are dropped from its list before new ones are recorded.
+        const gone = [];
+        if (released.size)
+            for (const [entryId, posts] of delivered) {
+                if (posts.every(ids => ids.some(id => released.has(id)))) {
+                    gone.push(entryId);
+                    delivered.delete(entryId);
+                }
+            }
         for (const instruction of instructions) {
             if (instruction?.type !== 'TimelineAddEntries' || !Array.isArray(instruction.entries))
                 continue;
@@ -91,7 +112,23 @@
             lastRemoved.list.splice(lastRemoved.at, 0, lastRemoved.entry);
             removed--;
         }
-        return removed;
+        for (const instruction of instructions) {
+            if (instruction?.type !== 'TimelineAddEntries' || !Array.isArray(instruction.entries))
+                continue;
+            for (const entry of instruction.entries) {
+                const content = entry?.content;
+                const posts = (Array.isArray(content?.items) ? content.items.map((item) => item?.item) : [content]).map(postIds).filter((ids) => ids.length);
+                if (typeof entry?.entryId === 'string' && posts.length) {
+                    delivered.delete(entry.entryId);
+                    delivered.set(entry.entryId, posts);
+                }
+            }
+        }
+        while (delivered.size > MAX_DELIVERED)
+            delivered.delete(delivered.keys().next().value);
+        if (gone.length)
+            instructions.push({ type: 'TimelineRemoveEntries', entryIds: gone });
+        return removed + gone.length;
     };
     const active = () => enabled && read.size > 0 && location.pathname === '/home';
     const nativeFetch = window.fetch;

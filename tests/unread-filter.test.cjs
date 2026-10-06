@@ -214,3 +214,15 @@ test('a post that appeared and was scrolled past the top counts as read even whe
   p.run(1000);
   assert.deepEqual(plain(p.messages.filter(m => m.type === 'MARK_POSTS_READ')), [{ type: 'MARK_POSTS_READ', postIds: ['31'] }]);
 });
+
+test('returning to the top tells the page filter which posts to drop from X, except those on screen', async () => {
+  const p = pageHarness();
+  const a = p.post('41'), b = p.post('42');
+  await p.start(); p.context.scrollY = 1500;
+  p.see(a.article, 1); p.run(500); p.see(b.article, 1); p.run(500);
+  a.cell.rect = { top: 100, bottom: 300, height: 200 };
+  b.cell.rect = { top: 1000, bottom: 1200, height: 200 };
+  p.mutate();
+  p.context.scrollY = 0; p.mutate();
+  assert.deepEqual(p.bridged.filter(m => m.release), [{ __xOriginalUnread: true, release: ['42'] }]);
+});

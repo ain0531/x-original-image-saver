@@ -125,3 +125,23 @@ test('at page start the home timeline XHR is held until the read list arrives, t
   const other = new aborted.context.XMLHttpRequest(); other.open('GET', 'https://x.com/i/api/graphql/Q/Bookmarks'); other.send(null);
   assert.equal(other.sent, 1);
 });
+
+test('posts released at the top are removed from the entries X already holds on its next timeline response', async () => {
+  const FIRST = HOME + '&page=1', SECOND = HOME + '&page=2', THIRD = HOME + '&page=3';
+  const p = page({ responses: {
+    [FIRST]: body([post('1'), post('2'), thread('3', '4'), repost('50', '5'), cursor]),
+    [SECOND]: body([post('6'), cursor]),
+    [THIRD]: body([post('7'), cursor]),
+  } });
+  p.send({ enabled: true, ids: ['9'] });
+  assert.deepEqual(ids(await (await p.fetch(FIRST)).json()), ['tweet-1', 'tweet-2', 'home-conversation-3', 'tweet-50', 'cursor-bottom-1']);
+  p.send({ ids: ['1', '3', '5'], release: ['1', '3', '5'] });
+  const second = await (await p.fetch(SECOND)).json();
+  const instructions = second.data.home.home_timeline_urt.instructions;
+  assert.deepEqual(plain(instructions.at(-1)), { type: 'TimelineRemoveEntries', entryIds: ['tweet-1', 'tweet-50'] }, 'a partly released thread stays');
+  const third = await (await p.fetch(THIRD)).json();
+  assert.equal(third.data.home.home_timeline_urt.instructions.some(i => i.type === 'TimelineRemoveEntries'), false, 'each entry is removed once');
+  p.send({ ids: ['4'], release: ['4'] });
+  const fourth = await (await p.fetch(FIRST)).json();
+  assert.deepEqual(plain(fourth.data.home.home_timeline_urt.instructions.at(-1)), { type: 'TimelineRemoveEntries', entryIds: ['home-conversation-3'] });
+});
