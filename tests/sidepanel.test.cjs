@@ -26,7 +26,7 @@ function harness({ get, sendMessage } = {}) {
   const messages = [];
   const document = { getElementById: id => {
     if (!elements.has(id)) elements.set(id, {
-      value: '', checked: !['specify-save-location', 'like-on-save'].includes(id), disabled: false, textContent: '',
+      value: '', checked: !['specify-save-location', 'like-on-save', 'unread-only'].includes(id), disabled: false, textContent: '',
       addEventListener: (event, listener) => { elements.get(id)[event] = listener; },
     });
     return elements.get(id);
@@ -36,6 +36,7 @@ function harness({ get, sendMessage } = {}) {
     storage: { local: { get: get ?? (async () => ({})), set: async () => {} } },
     runtime: { openOptionsPage: async () => {}, sendMessage: async message => {
       if (message.type === 'GET_SAVE_STATUS') return { ok: true };
+      if (message.type === 'GET_UNREAD_FILTER') return { ok: true, enabled: false, ids: [] };
       messages.push(message);
       return sendMessage ? sendMessage(message) : { ok: true, removed: 1 };
     } },
@@ -162,4 +163,18 @@ test('account media checkboxes select either or both types and block an empty se
   assert.equal(h.messages.length, 3); assert.match(h.elements.get('status').textContent, /動画または画像を選択/);
   mode.value = 'bookmarks'; mode.change(); h.elements.get('save-all-visible').click(); await flush();
   assert.equal(group.hidden, true); assert.equal(h.messages[3].type, 'SAVE_ALL_VISIBLE_IMAGES'); assert.equal(h.messages[3].mediaTypes, undefined);
+});
+
+test('unread-only checkbox starts from the session state and reverts when the request fails', async () => {
+  let fail = false;
+  const h = harness({ sendMessage: async message => fail ? { ok: false, error: 'rejected' } : { ok: true, enabled: message.enabled } });
+  await flush();
+  const input = h.elements.get('unread-only');
+  assert.equal(input.checked, false);
+  input.checked = true; input.change(); await flush(); await flush();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.messages.at(-1))), { type: 'SET_UNREAD_FILTER', enabled: true });
+  assert.equal(input.checked, true);
+  fail = true; input.checked = false; input.change(); await flush(); await flush();
+  assert.equal(input.checked, true);
+  assert.match(h.elements.get('status').textContent, /rejected/);
 });

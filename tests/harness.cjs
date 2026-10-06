@@ -57,7 +57,7 @@ function harness(initial = {}) {
     return { ok: true, json: async () => pages.length ? pages.shift() : page(ids) };
   };
   const context = vm.createContext({ chrome, fetch, crypto: require('node:crypto').webcrypto, TextEncoder, AbortController, URL, console, setTimeout, clearTimeout, setInterval, clearInterval });
-  for (const name of ['media', 'preferences', 'history', 'bookmarks', 'sources', 'direct-bookmarks', 'direct-account-media', 'jobs', 'background']) {
+  for (const name of ['media', 'preferences', 'history', 'bookmarks', 'sources', 'direct-bookmarks', 'direct-account-media', 'jobs', 'read-posts', 'background']) {
     const source = fs.readFileSync('dist/' + name + '.js', 'utf8').replace(/^import .*;\s*$/mg, '').replace(/\bexport (?=(?:async|class|function|const))/g, '').replace(/export\s*\{\s*\};?/g, '');
     vm.runInContext(source, context, { filename: name });
   }

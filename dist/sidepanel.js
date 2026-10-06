@@ -34,6 +34,20 @@ likeOnSaveInput?.addEventListener('change', () => {
     likeSettingWrite = likeSettingWrite.catch(() => { }).then(() => chrome.storage.local.set({ likeOnSave: checked }));
     void likeSettingWrite.catch(error => setStatus(`設定を保存できません: ${String(error)}`));
 });
+const unreadOnlyInput = document.getElementById('unread-only');
+let unreadSettingWrite = Promise.resolve();
+unreadOnlyInput?.addEventListener('change', () => {
+    const checked = unreadOnlyInput.checked;
+    unreadSettingWrite = unreadSettingWrite.catch(() => { }).then(async () => {
+        const response = await chrome.runtime.sendMessage({ type: 'SET_UNREAD_FILTER', enabled: checked });
+        if (!response?.ok)
+            throw new Error(response?.error ?? '応答がありません。');
+    });
+    void unreadSettingWrite.catch(error => {
+        unreadOnlyInput.checked = !checked;
+        setStatus(`設定を保存できません: ${error instanceof Error ? error.message : String(error)}`);
+    });
+});
 const checkAllSavedListInput = document.getElementById("check-all-saved-list");
 const statusElement = document.getElementById("status");
 function setStatus(message) {
@@ -76,6 +90,10 @@ async function initializeSidePanel() {
         specifySaveLocationInput.checked = stored.specifySaveLocation === true;
     if (likeOnSaveInput)
         likeOnSaveInput.checked = stored.likeOnSave === true;
+    if (unreadOnlyInput) {
+        const unread = await chrome.runtime.sendMessage({ type: 'GET_UNREAD_FILTER' });
+        unreadOnlyInput.checked = unread?.ok === true && unread.enabled === true;
+    }
     if (checkCurrentSavedListInput) {
         checkCurrentSavedListInput.checked = true;
     }
