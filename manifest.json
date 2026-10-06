@@ -1,25 +1,49 @@
 {
   "manifest_version": 3,
-  "name": "X Original Image Saver",
-  "version": "0.1.0",
-  "description": "Save original-quality images from X.",
+  "minimum_chrome_version": "116",
+  "name": "X 原寸画像保存",
+  "version": "0.6.0",
+  "description": "Xの投稿画像を原寸、動画を取得可能な最高ビットレートのMP4で保存します。",
   "permissions": [
     "activeTab",
     "scripting",
     "downloads",
-    "storage"
+    "storage",
+    "sidePanel",
+    "alarms",
+    "cookies",
+    "webRequest"
   ],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
-    "https://pbs.twimg.com/*"
+    "https://pbs.twimg.com/*",
+    "https://video.twimg.com/*",
+    "https://abs.twimg.com/responsive-web/*"
   ],
   "background": {
     "service_worker": "dist/background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "X Original Image Saver",
-    "default_popup": "popup.html"
-  }
+    "default_title": "X 原寸画像保存を開く"
+  },
+  "content_scripts": [{
+    "matches": ["https://x.com/*", "https://twitter.com/*"],
+    "js": ["dist/bookmark-reader.js", "dist/timeline-filter.js"],
+    "run_at": "document_start",
+    "world": "MAIN"
+  }, {
+    "matches": ["https://x.com/*", "https://twitter.com/*"],
+    "js": ["dist/post-buttons.js"],
+    "run_at": "document_idle"
+  }, {
+    "matches": ["https://x.com/*", "https://twitter.com/*"],
+    "js": ["dist/unread-filter.js"],
+    "run_at": "document_start"
+  }],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "options_ui": { "page": "options.html", "open_in_tab": true }
 }

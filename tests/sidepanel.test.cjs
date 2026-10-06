@@ -1,0 +1,180 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('an open side panel resolves the current window active tab for every save', async () => {
+  const h = harness({ sendMessage: async () => ({
+    ok: true, stats: { total: 0, success: 0, skipped: 0, failed: 0 },
+  }) });
+  await flush();
+  let id = 11;
+  h.chrome.tabs.query = async options => {
+    assert.equal(options.active, true);
+    assert.equal(options.currentWindow, true);
+    return [{ id, url: 'https://x.com/home' }];
+  };
+  h.elements.get('save-current-tweet').click(); await flush();
+  id = 12;
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.deepEqual(h.messages.map(message => message.tabId), [11, 12]);
+});
+
+function harness({ get, sendMessage } = {}) {
+  const elements = new Map();
+  const messages = [];
+  const document = { getElementById: id => {
+    if (!elements.has(id)) elements.set(id, {
+      value: '', checked: !['specify-save-location', 'like-on-save', 'unread-only'].includes(id), disabled: false, textContent: '',
+      addEventListener: (event, listener) => { elements.get(id)[event] = listener; },
+    });
+    return elements.get(id);
+  } };
+  const chrome = {
+    tabs: { query: async () => [{ id: 1, url: 'https://x.com/home' }] },
+    storage: { local: { get: get ?? (async () => ({})), set: async () => {} } },
+    runtime: { openOptionsPage: async () => {}, sendMessage: async message => {
+      if (message.type === 'GET_SAVE_STATUS') return { ok: true };
+      if (message.type === 'GET_UNREAD_FILTER') return { ok: true, enabled: false, ids: [] };
+      messages.push(message);
+      return sendMessage ? sendMessage(message) : { ok: true, removed: 1 };
+    } },
+  };
+  const context = vm.createContext({ document, chrome, window: { confirm: () => true }, setInterval: () => 1 });
+  vm.runInContext(fs.readFileSync('dist/sidepanel.js', 'utf8').replace(/export\s*\{\s*\};?/g, ''), context);
+  return { elements, context, chrome, messages };
+}
+
+test('side panel displays messaging failures and re-enables buttons', async () => {
+  const h = harness({ sendMessage: async () => { throw new Error('connection lost'); } });
+  await flush();
+  h.elements.get('save-current-tweet').click();
+  assert.equal(h.elements.get('clear-saved-history').disabled, true);
+  await flush();
+  assert.match(h.elements.get('status').textContent, /connection lost/);
+  assert.equal(h.elements.get('save-current-tweet').disabled, false);
+});
+
+test('side panel suppresses repeated clicks until the request finishes', async () => {
+  let resolve;
+  const pending = new Promise(r => { resolve = r; });
+  const h = harness({ sendMessage: () => pending });
+  await flush();
+  const button = h.elements.get('save-current-tweet');
+  button.click(); button.click();
+  await flush();
+  assert.equal(h.messages.length, 1);
+  resolve({ ok: true, stats: { total: 1, success: 1, skipped: 0, failed: 0 } });
+  await flush();
+  assert.equal(button.disabled, false);
+  assert.match(h.elements.get('status').textContent, /保存完了: 1/);
+});
+
+test('history deletion goes through the worker', async () => {
+  const h = harness(); await flush();
+  h.elements.get('clear-saved-history').click();
+  await flush();
+  assert.equal(h.messages[0].type, 'CLEAR_SAVED_HISTORY');
+  assert.match(h.elements.get('status').textContent, /消去件数: 1/);
+});
+
+test('initialization failures are visible and leave controls usable', async () => {
+  const h = harness({ get: async () => { throw new Error('storage unavailable'); } });
+  await flush();
+  assert.match(h.elements.get('status').textContent, /storage unavailable/);
+  assert.equal(h.elements.get('save-current-tweet').disabled, false);
+});
+
+test('side panel opens the registered options page', async () => {
+  const h = harness(); await flush(); let opened = false;
+  h.chrome.runtime.openOptionsPage = async () => { opened = true; };
+  h.elements.get('open-options').click(); await flush(); assert.equal(opened, true);
+  const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+  assert.equal(manifest.options_ui.page, 'options.html'); assert.equal(manifest.options_ui.open_in_tab, true);
+});
+
+test('save location checkbox defaults off and toggles only individual Save As requests', async () => {
+  const html = fs.readFileSync('sidepanel.html', 'utf8');
+  const input = html.match(/<input\b[^>]*id="specify-save-location"[^>]*>/)?.[0];
+  assert.ok(input); assert.ok(!/\bchecked\b/.test(input));
+  assert.ok(html.indexOf('id="save-current-tweet"') < html.indexOf('id="specify-save-location"'));
+  const h = harness(); await flush();
+  const checkbox = h.elements.get('specify-save-location');
+  assert.equal(checkbox.checked, false);
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(h.messages[0].saveAs, false);
+  checkbox.checked = true;
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(h.messages[1].saveAs, true);
+  h.elements.get('save-all-visible').click(); await flush();
+  assert.equal(h.messages[2].saveAs, false);
+});
+
+test('like checkbox defaults off, restores the shared setting and persists changes before saving', async () => {
+  const input = fs.readFileSync('sidepanel.html', 'utf8').match(/<input\b[^>]*id="like-on-save"[^>]*>/)?.[0];
+  assert.ok(input); assert.ok(!/\bchecked\b/.test(input));
+  const h = harness(); await flush();
+  assert.equal(h.elements.get('like-on-save').checked, false);
+  const restored = harness({ get: async () => ({ likeOnSave: true }) }); await flush();
+  assert.equal(restored.elements.get('like-on-save').checked, true);
+  const writes = []; let release;
+  restored.chrome.storage.local.set = async row => { writes.push(row); await new Promise(resolve => { release = resolve; }); };
+  const checkbox = restored.elements.get('like-on-save'); checkbox.checked = false; checkbox.change();
+  restored.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(writes[0].likeOnSave, false); assert.equal(restored.messages.length, 0);
+  release(); await flush(); assert.equal(restored.messages[0].type, 'SAVE_CURRENT_TWEET_IMAGES');
+});
+
+test('save-location checkbox restores and writes the shared local-save setting before a sidebar save', async () => {
+  const h = harness({ get: async () => ({ specifySaveLocation: true }) }); await flush();
+  const checkbox = h.elements.get('specify-save-location'); assert.equal(checkbox.checked, true);
+  const writes = []; let release;
+  h.chrome.storage.local.set = async row => { writes.push(row); await new Promise(resolve => { release = resolve; }); };
+  checkbox.checked = false; checkbox.change();
+  h.elements.get('save-current-tweet').click(); await flush();
+  assert.equal(writes[0].specifySaveLocation, false); assert.equal(h.messages.length, 0);
+  release(); await flush(); assert.equal(h.messages[0].saveAs, false);
+});
+
+test('bulk save defaults to bookmarks and routes the selected account mode with its explanation', async () => {
+  const html = fs.readFileSync('sidepanel.html', 'utf8');
+  assert.match(html, /id="save-all-visible">まとめて保存</); assert.match(html, /value="bookmarks" selected/);
+  assert.ok(html.indexOf('id="bulk-save-mode"') > html.indexOf('id="save-all-visible"'));
+  const h = harness(); await flush();
+  const mode = h.elements.get('bulk-save-mode'); assert.equal(mode.value, 'bookmarks');
+  h.elements.get('save-all-visible').click(); await flush(); assert.equal(h.messages[0].type, 'SAVE_ALL_VISIBLE_IMAGES');
+  mode.value = 'account'; mode.change(); assert.equal(h.elements.get('bulk-save-description').textContent, '現在開いているアカウントのメディアを保存します。');
+  h.elements.get('save-all-visible').click(); await flush(); assert.equal(h.messages[1].type, 'SAVE_ACCOUNT_MEDIA');
+  assert.equal(h.messages[1].saveAs, false);
+});
+
+test('account media checkboxes select either or both types and block an empty selection', async () => {
+  const h = harness(); await flush();
+  const group = h.elements.get('account-media-types'), mode = h.elements.get('bulk-save-mode');
+  assert.equal(group.hidden, true); mode.value = 'account'; mode.change(); assert.equal(group.hidden, false);
+  const videos = h.elements.get('account-save-videos'), images = h.elements.get('account-save-images');
+  assert.equal(videos.checked, true); assert.equal(images.checked, true);
+  for (const [video, image] of [[true, true], [true, false], [false, true]]) {
+    videos.checked = video; images.checked = image; h.elements.get('save-all-visible').click(); await flush();
+    const sent = h.messages.at(-1); assert.equal(sent.mediaTypes.videos, video); assert.equal(sent.mediaTypes.images, image);
+  }
+  videos.checked = false; images.checked = false; h.elements.get('save-all-visible').click(); await flush();
+  assert.equal(h.messages.length, 3); assert.match(h.elements.get('status').textContent, /動画または画像を選択/);
+  mode.value = 'bookmarks'; mode.change(); h.elements.get('save-all-visible').click(); await flush();
+  assert.equal(group.hidden, true); assert.equal(h.messages[3].type, 'SAVE_ALL_VISIBLE_IMAGES'); assert.equal(h.messages[3].mediaTypes, undefined);
+});
+
+test('unread-only checkbox starts from the session state and reverts when the request fails', async () => {
+  let fail = false;
+  const h = harness({ sendMessage: async message => fail ? { ok: false, error: 'rejected' } : { ok: true, enabled: message.enabled } });
+  await flush();
+  const input = h.elements.get('unread-only');
+  assert.equal(input.checked, false);
+  input.checked = true; input.change(); await flush(); await flush();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.messages.at(-1))), { type: 'SET_UNREAD_FILTER', enabled: true });
+  assert.equal(input.checked, true);
+  fail = true; input.checked = false; input.change(); await flush(); await flush();
+  assert.equal(input.checked, true);
+  assert.match(h.elements.get('status').textContent, /rejected/);
+});

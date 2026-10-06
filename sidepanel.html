@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>X 原寸画像保存</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 12px;
+        overflow-wrap: anywhere;
+      }
+
+      input[type="number"] {
+        box-sizing: border-box;
+        width: 100%;
+        min-width: 0;
+      }
+
+      h1 {
+        font-size: 14px;
+        margin: 0 0 12px 0;
+      }
+
+      .button-group {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .action-row {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .action-option {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: #333;
+      }
+
+      button {
+        padding: 10px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      #status {
+        margin-top: 12px;
+        font-size: 12px;
+        color: #333;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>X 原寸画像保存</h1>
+    <p id="version" style="font-size:12px"></p>
+    <p style="font-size:12px">通常はデータ通信でブックマークの画像・動画を保存します。初回取得に必要な場合だけタブを一時的に開き、通信後に自動で閉じます。画像は原寸、動画は取得できたMP4の最高ビットレートを選びます。HLSのみの動画は未対応です。</p>
+
+    <div class="button-group">
+      <div class="action-row">
+        <label class="action-option">
+          <input id="unread-only" type="checkbox" />
+          未読の投稿のみを表示
+        </label>
+        <p style="margin:0;font-size:12px;color:#333">ホーム（おすすめ／フォロー中）で、ONの間に表示した投稿を次回から隠します。既読の記録は拡張機能・ブラウザの再起動で消えます。</p>
+      </div>
+
+      <div class="action-row">
+        <button id="save-current-tweet">現在の投稿の画像・動画を保存</button>
+        <label class="action-option">
+          <input id="like-on-save" type="checkbox" />
+          同時にいいねする
+        </label>
+        <label class="action-option">
+          <input id="specify-save-location" type="checkbox" />
+          保存先を指定
+        </label>
+        <label class="action-option">
+          <input id="check-current-saved-list" type="checkbox" checked disabled />
+          メディアIDで保存済みを確認（常に有効）
+        </label>
+      </div>
+
+      <div class="action-row">
+        <button id="save-all-visible">まとめて保存</button>
+        <label class="action-option" for="bulk-save-mode">保存モード</label>
+        <select id="bulk-save-mode">
+          <option value="bookmarks" selected>ブックマークから保存</option>
+          <option value="account">個別アカウントからの保存</option>
+        </select>
+        <div id="account-media-types" hidden>
+          <label class="action-option"><input id="account-save-videos" type="checkbox" checked />動画</label>
+          <label class="action-option"><input id="account-save-images" type="checkbox" checked />画像</label>
+        </div>
+        <p id="bulk-save-description" style="margin:0;font-size:12px;color:#333">ブックマークに保存された投稿から動画と画像を保存します。</p>
+        <label class="action-option">
+          <input id="check-all-saved-list" type="checkbox" checked disabled />
+          メディアIDで保存済みを確認（常に有効）
+        </label>
+      </div>
+
+      <div class="action-row">
+        <button id="clear-saved-history">保存履歴を消去</button>
+      </div>
+      <button id="pause-save" disabled>一時停止</button>
+      <button id="resume-save" disabled>未処理分・続きから再開</button>
+    </div>
+
+    <p><button id="open-options" type="button">オプション</button></p>
+
+    <div id="status" role="status" aria-live="polite">待機中</div>
+
+    <script type="module" src="dist/sidepanel.js"></script>
+  </body>
+</html>
