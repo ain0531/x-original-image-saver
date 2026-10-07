@@ -1,8 +1,9 @@
-// Runs in the page's MAIN world. Removes read posts from X's home timeline responses before
-// X renders them, so hiding never happens inside the visible area. The read list arrives from
+// Runs in the page's MAIN world. Removes read posts from X's home timeline and search "Top" tab
+// responses before X renders them, so hiding never happens inside the visible area. The read list arrives from
 // the isolated unread-filter script through window.postMessage. Posts read on this page that are
 // released on returning to the top are removed from X's own list with TimelineRemoveEntries on the
 // next timeline response, so X stops redrawing them (hiding them one by one stalled scrolling).
+// X ignores TimelineRemoveEntries on the search timeline, so nothing is released there.
 (() => {
   const host = window as any;
   if (host.__xOriginalTimelineFilter) return;
@@ -35,9 +36,19 @@
     if (Array.isArray(data.ids)) for (const id of data.ids) if (typeof id === 'string' && /^\d+$/.test(id)) read.add(id);
     markReady();
   });
-  const isHomeTimeline = (raw: string) => {
-    try { const url = new URL(raw, location.href); return url.origin === location.origin && /^\/i\/api\/graphql\/[^/]+\/(HomeTimeline|HomeLatestTimeline)$/.test(url.pathname); }
-    catch { return false; }
+  type Kind = 'home' | 'search';
+  // Search requests carry the tab in `product`; only "Top" is filtered.
+  const timelineKind = (raw: string): Kind | undefined => {
+    try {
+      const url = new URL(raw, location.href);
+      const name = url.origin === location.origin ? url.pathname.match(/^\/i\/api\/graphql\/[^/]+\/(HomeTimeline|HomeLatestTimeline|SearchTimeline)$/)?.[1] : undefined;
+      if (name !== 'SearchTimeline') return name ? 'home' : undefined;
+      return JSON.parse(url.searchParams.get('variables') ?? '')?.product === 'Top' ? 'search' : undefined;
+    } catch { return; }
+  };
+  const isSearchTop = () => {
+    const tab = new URL(location.href).searchParams.get('f');
+    return location.pathname === '/search' && (tab === null || tab === 'top');
   };
   const tweet = (result: any) => result?.__typename === 'TweetWithVisibilityResults' ? result.tweet : result;
   // The DOM records a repost under the original post's ID, so check both.
@@ -50,14 +61,14 @@
   // Returns the number of removed entries. Entries are removed whole: X keeps the post IDs of
   // a conversation module in its metadata, so a module is dropped only when every post is read.
   // A page is never emptied of posts, or X stops loading; its last read entry is kept instead.
-  const filter = (body: any): number => {
-    const instructions = body?.data?.home?.home_timeline_urt?.instructions;
+  const filter = (body: any, kind: Kind): number => {
+    const instructions = kind === 'home' ? body?.data?.home?.home_timeline_urt?.instructions : body?.data?.search_by_raw_query?.search_timeline?.timeline?.instructions;
     if (!Array.isArray(instructions)) return 0;
     let removed = 0, kept = 0;
     let lastRemoved: { list: any[]; at: number; entry: any } | undefined;
     // Released entries X already holds are dropped from its list before new ones are recorded.
     const gone: string[] = [];
-    if (released.size) for (const [entryId, posts] of delivered) {
+    if (kind === 'home' && released.size) for (const [entryId, posts] of delivered) {
       if (posts.every(ids => ids.some(id => released.has(id)))) { gone.push(entryId); delivered.delete(entryId); }
     }
     for (const instruction of instructions) {
@@ -74,6 +85,7 @@
       instruction.entries = next;
     }
     if (removed && !kept && lastRemoved) { lastRemoved.list.splice(lastRemoved.at, 0, lastRemoved.entry); removed--; }
+    if (kind === 'search') return removed;
     for (const instruction of instructions) {
       if (instruction?.type !== 'TimelineAddEntries' || !Array.isArray(instruction.entries)) continue;
       for (const entry of instruction.entries) {
@@ -86,13 +98,14 @@
     if (gone.length) instructions.push({ type: 'TimelineRemoveEntries', entryIds: gone });
     return removed + gone.length;
   };
-  const active = () => enabled && read.size > 0 && location.pathname === '/home';
+  const active = (kind: Kind) => enabled && read.size > 0 && (kind === 'home' ? location.pathname === '/home' : isSearchTop());
   const nativeFetch = window.fetch;
   window.fetch = async function(this: unknown, input: RequestInfo | URL, init?: RequestInit) {
     const response = await nativeFetch.call(this, input, init);
     if (!response.ok || (!enabled && (received || !wasOn))) return response;
     const url = input instanceof Request ? input.url : String(input);
-    if (!isHomeTimeline(url)) return response;
+    const kind = timelineKind(url);
+    if (!kind) return response;
     try {
       // The read list loads asynchronously at page start; wait briefly for it.
       if (!received) {
@@ -100,15 +113,15 @@
         await Promise.race([ready, new Promise<void>(resolve => { timer = setTimeout(resolve, STATE_WAIT); })]);
         clearTimeout(timer);
       }
-      if (!active()) return response;
+      if (!active(kind)) return response;
       const body = await response.clone().json();
-      if (!filter(body)) return response;
+      if (!filter(body, kind)) return response;
       const filtered = new Response(JSON.stringify(body), { status: response.status, statusText: response.statusText, headers: response.headers });
       Object.defineProperty(filtered, 'url', { value: response.url });
       return filtered;
     } catch { return response; }
   };
-  // X loads the home timeline with XMLHttpRequest. Its response is read synchronously, so at page
+  // X loads these timelines with XMLHttpRequest. Its response is read synchronously, so at page
   // start (filter on, list not yet arrived) the request itself is held until the list arrives.
   const open = XMLHttpRequest.prototype.open;
   const send = XMLHttpRequest.prototype.send;
@@ -122,18 +135,19 @@
     delete (this as any).responseText; delete (this as any).response;
     nextGeneration(this);
     const waiting = !received && wasOn;
-    if ((enabled || waiting) && isHomeTimeline(String(url))) {
+    const kind = enabled || waiting ? timelineKind(String(url)) : undefined;
+    if (kind) {
       if (waiting) held.add(this);
       let cached: { text: string; json: unknown } | undefined;
       let done = false;
       // The body is parsed at most once, and only while the filter is active.
       const result = (): typeof cached => {
-        if (done || this.readyState !== 4 || this.status < 200 || this.status >= 300 || !active()) return cached;
+        if (done || this.readyState !== 4 || this.status < 200 || this.status >= 300 || !active(kind)) return cached;
         done = true;
         try {
           const raw = this.responseType === 'json' ? responseGetter.call(this) : textGetter.call(this);
           const body = typeof raw === 'string' ? JSON.parse(raw) : structuredClone(raw);
-          if (active() && filter(body)) cached = { text: JSON.stringify(body), json: body };
+          if (active(kind) && filter(body, kind)) cached = { text: JSON.stringify(body), json: body };
         } catch { /* An unreadable response is passed through unchanged. */ }
         return cached;
       };

@@ -1,8 +1,11 @@
-// Unread-only filter for the home timeline. A post becomes read when shown for 0.5s, or when it
-// was on screen and then scrolled past the top (quick skimming). The read list is
+// Unread-only filter for the home timeline and the search "Top" tab. A post becomes read when
+// shown for 0.5s, or when it was on screen and then scrolled past the top (quick skimming). The read list is
 // passed to timeline-filter (MAIN world), which drops read posts from X's timeline responses
 // before they are rendered. Posts read on this page stay in X's own list and are not hidden while
-// scrolling back; returning to the very top releases them so they are hidden from then on.
+// scrolling back; on home, returning to the very top releases them so they are hidden from then on.
+// Search results are not released while staying on the page: X ignores the removal there, and
+// hiding them one by one in the DOM stalls scrolling. They are left out from the next search, and
+// once the page is left they are hidden when X redraws it from its cache (Back does not refetch).
 // Posts already painted are only hidden below the visible area, so what is on screen never moves.
 (() => {
   const instance = globalThis as any;
@@ -10,6 +13,9 @@
   instance.__xOriginalUnreadFilter = true;
   const hiddenMarker = 'data-x-original-unread-hidden';
   const READ_DELAY = 500;
+  // After arriving at a search page, X draws it in one go (from its cache on Back, restoring the
+  // scroll position); read posts drawn in this window are hidden even on screen, before paint.
+  const ARRIVAL_WINDOW = 1000;
   // X's in-timeline "N件のポストを表示" bar. The floating "posted" pill is not matched.
   const NEW_POSTS_LABEL = /^(?:[\d,.]+\s*件の(?:ポスト|ツイート)を表示|Show\s+[\d,.]+[KM]?\s+(?:posts?|Tweets?))$/i;
   let lastExpand = 0;
@@ -21,6 +27,9 @@
   let evaluated = new WeakMap<Element, string>();
   const read = new Set<string>();
   const readHere = new Set<string>();
+  const readOnSearch = new Set<string>();
+  let lastPage = pageKey();
+  let arrivedAt = 0;
   const pending = new Set<string>();
   const watched = new Set<Element>();
   const appeared = new WeakSet<Element>();
@@ -33,6 +42,20 @@
     catch { return false; }
   }
   function onHome(): boolean { return location.pathname === '/home'; }
+  function onSearchTop(): boolean {
+    const tab = new URL(location.href).searchParams.get('f');
+    return location.pathname === '/search' && (tab === null || tab === 'top');
+  }
+  function onTarget(): boolean { return onHome() || onSearchTop(); }
+  function pageKey(): string { const url = new URL(location.href); return url.pathname + url.search; }
+  // Leaving a search page releases the posts read there; arriving at one opens the arrival window.
+  function checkPage(): void {
+    const page = pageKey();
+    if (page === lastPage) return;
+    lastPage = page;
+    readOnSearch.forEach(id => readHere.delete(id)); readOnSearch.clear();
+    if (onSearchTop()) arrivedAt = Date.now();
+  }
   function postId(article: Element): string | undefined {
     const link = Array.from(article.querySelectorAll('a[href]')).find(link => link.querySelector('time') && link.closest('article') === article);
     if (!link) return;
@@ -83,10 +106,11 @@
   }
   function markRead(article: Element): void {
     const id = evaluated.get(article);
-    if (!enabled || stopped || !onHome() || !article.isConnected || !id || postId(article) !== id) return;
+    if (!enabled || stopped || !onTarget() || !article.isConnected || !id || postId(article) !== id) return;
     unwatch(article);
     if (read.has(id)) return;
     read.add(id); readHere.add(id); pending.add(id);
+    if (onSearchTop()) readOnSearch.add(id);
     bridge({ ids: [id] });
     if (flushTimer === undefined) flushTimer = setTimeout(flush, 1000);
   }
@@ -105,17 +129,19 @@
   function scan(): void {
     if (!alive()) { cleanup(); return; }
     if (!enabled) return;
-    if (!onHome()) { if (watched.size || document.querySelector(`[${hiddenMarker}]`)) reset(); return; }
+    checkPage();
+    if (!onTarget()) { if (watched.size || document.querySelector(`[${hiddenMarker}]`)) reset(); return; }
     for (const article of Array.from(watched)) if (!article.isConnected) unwatch(article);
     const root = timelineRoot();
     if (!root) return;
     checkTop(root);
     for (const article of Array.from(root.querySelectorAll('article'))) evaluate(article);
-    expandNewPosts(root);
+    if (onHome()) expandNewPosts(root);
   }
   // Arriving back at the top after scrolling at least one screen releases posts read on this page:
   // those X still keeps rendered below the viewport are hidden now, the rest when X draws them.
   function checkTop(root: Element | null): void {
+    if (!onHome()) { awayFromTop = false; return; }
     if (scrollY > innerHeight) { awayFromTop = true; return; }
     if (scrollY > 1 || !awayFromTop || !root) return;
     awayFromTop = false;
@@ -150,6 +176,7 @@
     lastExpand = Date.now();
     button.click();
   }
+  function arriving(): boolean { return onSearchTop() && Date.now() - arrivedAt < ARRIVAL_WINDOW; }
   function timelineRoot(): Element | null {
     return document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
   }
@@ -164,15 +191,17 @@
     // Fallback for posts X shows from its own list: hide only posts read before this page, in
     // another tab, or before returning to the top. A newly drawn cell is hidden before it is
     // painted when it is below the visible area, or anywhere while at the top (X redraws the top
-    // after a jump there and on load, and nothing above can shift).
-    if (read.has(id)) { if (hideable(id) && (belowViewport(cell) || scrollY <= 1)) hide(article); }
+    // after a jump there and on load, and nothing above can shift), or right after arriving at a
+    // search page.
+    if (read.has(id)) { if (hideable(id) && (belowViewport(cell) || scrollY <= 1 || arriving())) hide(article); }
     else { watched.add(article); visibility.observe(article); }
   }
   // Mutation callbacks run before the next paint, so read posts X adds (including the ones it
   // pre-renders below the viewport) are hidden before they are ever drawn at full height.
   function onMutations(records: MutationRecord[] = []): void {
     if (stopped || !enabled) return;
-    if (onHome()) {
+    checkPage();
+    if (onTarget()) {
       const root = timelineRoot();
       checkTop(root);
       for (const record of records) {
@@ -192,7 +221,7 @@
     if (enabled === next) { schedule(); return; }
     enabled = next;
     if (next) { scan(); return; }
-    pending.clear(); read.clear(); readHere.clear(); reset();
+    pending.clear(); read.clear(); readHere.clear(); readOnSearch.clear(); reset();
     if (flushTimer !== undefined) { clearTimeout(flushTimer); flushTimer = undefined; }
   }
   async function load(): Promise<void> {
