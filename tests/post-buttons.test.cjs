@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const flush = () => new Promise(resolve => setImmediate(resolve));
-function buttonHarness(active = true) {
+function buttonHarness(active = true, selections = {}) {
   class Element {
     constructor(tag) { this.tag = tag; this.children = []; this.attributes = {}; this.style = {}; this.listeners = {}; this.isConnected = true; }
     get parentElement() { return this.parent; }
@@ -46,7 +46,7 @@ function buttonHarness(active = true) {
     querySelectorAll: selector => articles.flatMap(article => article.querySelectorAll(selector)),
     createElement: tag => new Element(tag), addEventListener() {}, removeEventListener() {},
   };
-  const chrome = { runtime: { id: 'test', getManifest: () => { if (!active) throw new Error('Extension context invalidated'); return {}; }, sendMessage: async message => { requests.push(message); throw new Error('No download messages allowed'); } } };
+  const chrome = { storage: { local: { get: async () => ({ specialSaveBookmarkFolders: selections }) }, onChanged: { addListener() {} } }, runtime: { id: 'test', getManifest: () => { if (!active) throw new Error('Extension context invalidated'); return {}; }, sendMessage: async message => { requests.push(message); throw new Error('No download messages allowed'); } } };
   class Observer { constructor(callback) { this.callback = callback; observer = this; } observe() {} disconnect() { this.disconnected = true; } }
   const context = vm.createContext({ document, chrome, location: { href: 'https://x.com/home' }, URL, MutationObserver: Observer,
     setInterval: callback => { intervals.push(callback); return intervals.length; }, clearInterval() {},
@@ -142,4 +142,59 @@ test('recycled timeline article never saves using its old post ID', async () => 
   article.querySelector('a[href]').href = 'https://x.com/user/status/999';
   row.children[2].click(); await flush(); assert.deepEqual(h.requests, []);
   h.mutate(); assert.equal(rows(article)[0].getAttribute('data-x-original-save'), '999');
+});
+
+test('folder special save adds an already bookmarked post and reports the exact folder', async () => {
+  const h = buttonHarness(true, { login: { id: '10', name: '資料' } });
+  await flush(); h.mutate();
+  const article = h.articles[0], row = rows(article)[0];
+  article.controls.like.setAttribute('data-testid', 'unlike'); article.controls.bookmark.setAttribute('data-testid', 'removeBookmark');
+  h.chrome.runtime.sendMessage = async message => { h.requests.push(message); return { ok: true, configured: true, folder: { id: '10', name: '資料' } }; };
+  h.mutate(); assert.equal(row.children[0].getAttribute('aria-pressed'), 'false');
+  row.children[0].click(); await flush();
+  assert.deepEqual(article.clicks, []); assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].type, 'SPECIAL_SAVE_FOLDER'); assert.equal(h.requests[0].postId, '101');
+  assert.match(row.children[1].textContent, /フォルダ「資料」に登録済み/);
+});
+test('folder rejection remains visible and retry never toggles the native bookmark off', async () => {
+  const h = buttonHarness(true, { login: { id: '10', name: '資料' } }); await flush(); h.mutate();
+  const row = rows(h.articles[0])[0];
+  h.chrome.runtime.sendMessage = async () => ({ ok: false, error: '保存先が消失' });
+  row.children[0].click(); await flush();
+  assert.match(row.children[1].textContent, /フォルダ登録.*保存先が消失/);
+  assert.equal(row.children[0].getAttribute('aria-pressed'), 'false');
+  row.children[0].click(); await flush(); assert.deepEqual(h.articles[0].clicks, ['like', 'bookmark']);
+});
+
+test('native X article replacement during both controls still registers the folder and displays the result on the new row', async () => {
+  const h = buttonHarness(true, { login: { id: '10', name: '資料' } }); await flush(); h.mutate();
+  const original = h.articles[0], clicked = rows(original)[0].children[0];
+  original.controls.like.listeners.click = () => {
+    const next = h.make('101'); next.controls.like.setAttribute('data-testid', 'unlike');
+    next.controls.bookmark.listeners.click = () => {
+      const newest = h.make('101'); newest.controls.like.setAttribute('data-testid', 'unlike'); newest.controls.bookmark.setAttribute('data-testid', 'removeBookmark');
+      next.isConnected = false; h.articles[0] = newest; h.mutate();
+      assert.equal(rows(newest)[0].children[0].disabled, true);
+      rows(newest)[0].children[0].click();
+    };
+    original.isConnected = false; h.articles[0] = next; h.mutate();
+  };
+  h.chrome.runtime.sendMessage = async message => { h.requests.push(message); return { ok: true, configured: true, folder: { id: '10', name: '資料' } }; };
+  clicked.click(); await flush(); h.mutate();
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].postId, '101');
+  assert.match(rows(h.articles[0])[0].children[1].textContent, /フォルダ「資料」に登録済み/);
+  assert.equal(rows(h.articles[0])[0].children[0].disabled, false);
+  const final = h.make('101'); h.articles[0].isConnected = false; h.articles[0] = final; h.mutate();
+  assert.match(rows(final)[0].children[1].textContent, /フォルダ「資料」に登録済み/);
+});
+test('a row replaced while the folder request is pending keeps its error visible', async () => {
+  const h = buttonHarness(true, { login: { id: '10', name: '資料' } }); await flush(); h.mutate();
+  let finish;
+  h.chrome.runtime.sendMessage = () => new Promise(resolve => { finish = resolve; });
+  rows(h.articles[0])[0].children[0].click(); await flush();
+  const next = h.make('101'); next.controls.like.setAttribute('data-testid', 'unlike'); next.controls.bookmark.setAttribute('data-testid', 'removeBookmark');
+  h.articles[0].isConnected = false; h.articles[0] = next; h.mutate();
+  assert.match(rows(next)[0].children[1].textContent, /指定フォルダへ登録しています/);
+  finish({ ok: false, error: '指定フォルダに含まれていません' }); await flush(); h.mutate();
+  assert.match(rows(next)[0].children[1].textContent, /フォルダ登録.*含まれていません/);
 });
