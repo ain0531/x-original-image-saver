@@ -9,7 +9,7 @@
     h1 { font-size: 24px; } h2 { font-size: 18px; margin-top: 0; }
     section { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
     label { display: block; font-weight: 600; margin-top: 16px; }
-    input { display: block; box-sizing: border-box; width: 100%; padding: 8px; margin-top: 4px; font: inherit; }
+    input, select { display: block; box-sizing: border-box; width: 100%; padding: 8px; margin-top: 4px; font: inherit; }
     p { margin: 8px 0; } .help { color: #555; font-size: 13px; }
     button { padding: 10px 16px; font: inherit; cursor: pointer; }
     #status { white-space: pre-wrap; } #preview { overflow-wrap: anywhere; }
@@ -44,6 +44,22 @@
     <button id="save-options" type="submit" disabled>設定を保存</button>
   </form>
   <p id="status" role="status" aria-live="polite">設定を読み込んでいます...</p>
+  <section aria-labelledby="bookmark-title">
+    <h2 id="bookmark-title">特別保存のブックマークフォルダ</h2>
+    <p>「特別保存」でいいね・ブックマークに加えて、選択したXのフォルダへ登録します。フォルダ機能はBasic以上で利用できます。</p>
+    <p class="help">ログイン済みのXのタブがあれば、フォルダ一覧は自動で取得します。登録先を選んで保存してください。</p>
+    <label for="bookmark-tab">設定するXのタブ</label>
+    <select id="bookmark-tab"></select>
+    <button id="reload-bookmark-tabs" type="button">Xタブを再検出</button>
+    <button id="load-bookmark-folders" type="button">フォルダ一覧を再取得</button>
+    <label for="bookmark-selection">特別保存の登録先</label>
+    <select id="bookmark-selection" disabled><option value="">フォルダ指定なし</option></select>
+    <button id="save-bookmark-folder" type="button" disabled>登録先を保存</button>
+    <button id="clear-bookmark-folders" type="button">すべての登録先を解除</button>
+    <p id="bookmark-status" role="status" aria-live="polite"></p>
+    <p class="help">登録先はXアカウントごとに保存します。指定フォルダへの登録に失敗した場合は、投稿のボタン下に理由を表示します。</p>
+  </section>
+  <script type="module" src="dist/bookmark-folder-options.js"></script>
   <script type="module" src="dist/options.js"></script>
 </body>
 </html>
