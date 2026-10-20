@@ -173,6 +173,26 @@ test('worker settings and registration use verified login and sender tab, keepin
   const mutation = calls.at(-1); assert.equal(mutation.target.tabId, 1); assert.equal(mutation.args[2], '10'); assert.equal(mutation.args[3], '202');
   assert.equal(h.calls.length, 0);
 });
+test('consecutive special saves register folders one at a time in order and a failure does not stop the queue', async () => {
+  const { h, calls } = folderWorker();
+  const listed = await h.request({ type: 'LIST_BOOKMARK_FOLDERS', tabId: 1 }, optionsSender);
+  await h.request({ type: 'SET_BOOKMARK_FOLDER', tabId: 1, account: listed.account, folderId: '10' }, optionsSender);
+  const execute = h.chrome.scripting.executeScript;
+  let active = 0, peak = 0;
+  h.chrome.scripting.executeScript = async options => {
+    if (options.files) return [];
+    active++; peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active--;
+    if (options.args[0] === 'add' && options.args[3] === '302') return [{ result: { ok: false, error: 'busy' } }];
+    return execute(options);
+  };
+  calls.length = 0;
+  const results = await Promise.all(['301', '302', '303'].map(postId => h.request({ type: 'SPECIAL_SAVE_FOLDER', postId }, postSender)));
+  assert.equal(peak, 1);
+  assert.deepEqual(results.map(result => result.ok), [true, false, true]);
+  assert.deepEqual(calls.filter(call => call.args[0] === 'add').map(call => call.args[3]), ['301', '303']);
+});
 test('worker rejects forged senders, stale accounts and nonexistent folders', async () => {
   const { h, calls } = folderWorker();
   assert.equal((await h.request({ type: 'SPECIAL_SAVE_FOLDER', postId: '202' }, optionsSender)).ok, false);

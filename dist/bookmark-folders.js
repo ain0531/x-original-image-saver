@@ -3,6 +3,9 @@ export const BOOKMARK_FOLDER_KEY = 'specialSaveBookmarkFolders';
 export class BookmarkFolders {
     constructor() {
         this.captures = Promise.resolve();
+        // X rejects overlapping folder requests, so consecutive special saves (and
+        // option-page listings) reach X one at a time in arrival order.
+        this.queue = Promise.resolve();
         this.authentication = new Map();
         // Observe the actual Web client's headers even when its fetch reference was
         // bound before our MAIN-world observer installed. Never replay transaction IDs.
@@ -49,6 +52,11 @@ export class BookmarkFolders {
             if (tab.id !== undefined)
                 await chrome.tabs.remove(tab.id).catch(() => { });
         }
+    }
+    serial(task) {
+        const result = this.queue.then(task);
+        this.queue = result.catch(() => { });
+        return result;
     }
     async clear() { await chrome.storage.local.remove(BOOKMARK_FOLDER_KEY); return {}; }
     async settingsAccount(tabId, identity) {
@@ -103,14 +111,17 @@ export class BookmarkFolders {
             await chrome.storage.session.set({ [cacheKey]: { at: Date.now(), templates: result.templates } });
         return result;
     }
-    async list(tabId) {
+    list(tabId) { return this.serial(() => this.listNow(tabId)); }
+    select(tabId, expectedAccount, folderId) { return this.serial(() => this.selectNow(tabId, expectedAccount, folderId)); }
+    add(tabId, postId) { return this.serial(() => this.addNow(tabId, postId)); }
+    async listNow(tabId) {
         const identity = await directBookmarks.login(tabId);
         const account = await this.settingsAccount(tabId, identity);
         const result = await this.run(tabId, 'list', identity);
         return { folders: result.folders, account, selected: await this.selection(account, identity.scope) };
     }
-    async select(tabId, expectedAccount, folderId) {
-        const current = await this.list(tabId);
+    async selectNow(tabId, expectedAccount, folderId) {
+        const current = await this.listNow(tabId);
         if (current.account !== expectedAccount)
             throw new Error('Xのアカウントが変わりました。一覧を読み込み直してください。');
         const folder = current.folders.find(folder => folder.id === folderId);
@@ -124,7 +135,7 @@ export class BookmarkFolders {
         await chrome.storage.local.set({ [BOOKMARK_FOLDER_KEY]: stored });
         return { selected: folder };
     }
-    async add(tabId, postId) {
+    async addNow(tabId, postId) {
         const identity = await directBookmarks.login(tabId);
         const account = await this.settingsAccount(tabId, identity);
         const selected = await this.selection(account, identity.scope);
