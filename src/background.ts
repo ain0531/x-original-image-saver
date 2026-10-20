@@ -1,9 +1,11 @@
 import { SaveJobs, PostSaveQueue } from './jobs.js';
 import { errorText, isXPage } from './media.js';
 import { ReadPosts } from './read-posts.js';
+import { BookmarkFolders } from './bookmark-folders.js';
 const saves = new SaveJobs();
 const localSaves = new PostSaveQueue();
 const readPosts = new ReadPosts();
+const bookmarkFolders = new BookmarkFolders();
 void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
 async function broadcastToXTabs(message: unknown, exceptTabId?: number): Promise<void> {
   const tabs = await chrome.tabs.query({ url: ['https://x.com/*', 'https://twitter.com/*'] });
@@ -13,6 +15,18 @@ async function broadcastToXTabs(message: unknown, exceptTabId?: number): Promise
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const trustedPost = sender.id === chrome.runtime.id && sender.frameId === 0 && Number.isInteger(sender.tab?.id) && isXPage(sender.url ?? '') && isXPage(sender.tab?.url ?? '');
   const trustedPanel = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL('sidepanel.html');
+  const trustedOptions = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL('options.html');
+  if (['LIST_BOOKMARK_FOLDERS', 'SET_BOOKMARK_FOLDER', 'CLEAR_BOOKMARK_FOLDERS', 'SPECIAL_SAVE_FOLDER'].includes(message?.type)) {
+    const post = message.type === 'SPECIAL_SAVE_FOLDER';
+    const allowed = post ? trustedPost && typeof message.postId === 'string' && /^\d+$/.test(message.postId)
+      : trustedOptions && (message.type === 'CLEAR_BOOKMARK_FOLDERS' || Number.isInteger(message.tabId) && message.tabId >= 0 && (message.type !== 'SET_BOOKMARK_FOLDER' || typeof message.account === 'string' && typeof message.folderId === 'string' && /^(?:\d+)?$/.test(message.folderId)));
+    if (!allowed) { sendResponse({ ok: false, error: 'この画面からの要求は受け付けられません。' }); return false; }
+    const operation = message.type === 'CLEAR_BOOKMARK_FOLDERS' ? bookmarkFolders.clear() : post ? bookmarkFolders.add(sender.tab!.id!, message.postId)
+      : message.type === 'LIST_BOOKMARK_FOLDERS' ? bookmarkFolders.list(message.tabId)
+      : bookmarkFolders.select(message.tabId, message.account, message.folderId);
+    void operation.then(result => sendResponse({ ok: true, ...result }), error => sendResponse({ ok: false, error: errorText(error) }));
+    return true;
+  }
   if (['GET_UNREAD_FILTER', 'SET_UNREAD_FILTER', 'MARK_POSTS_READ'].includes(message?.type)) {
     const allowed = message.type === 'SET_UNREAD_FILTER' ? trustedPanel && typeof message.enabled === 'boolean'
       : message.type === 'GET_UNREAD_FILTER' ? trustedPanel || trustedPost

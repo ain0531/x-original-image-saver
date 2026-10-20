@@ -8,8 +8,24 @@
     const marker = 'data-x-original-save';
     let stopped = false;
     let scheduled;
-    const busy = new WeakSet();
+    const busy = new Set();
+    const specialStatus = new Map();
     const localBusy = new WeakSet();
+    const folderKey = 'specialSaveBookmarkFolders';
+    let folderConfigured = false;
+    const folderReady = chrome.storage.local.get(folderKey).then(stored => {
+        folderConfigured = Object.keys(stored[folderKey] ?? {}).length > 0;
+        schedule();
+    });
+    // Keep storage failures visible when the user next requests a save.
+    void folderReady.catch(() => { });
+    chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local' || !changes[folderKey])
+            return;
+        folderConfigured = Object.keys(changes[folderKey].newValue ?? {}).length > 0;
+        specialStatus.clear();
+        schedule();
+    });
     const observer = new MutationObserver(() => schedule());
     const timer = setInterval(() => { if (!enabled())
         cleanup(); }, 1000);
@@ -53,30 +69,49 @@
     function control(article, testId) {
         return Array.from(article.querySelectorAll(`[data-testid="${testId}"]`)).find(node => node.closest('article') === article);
     }
+    function currentArticle(id, previous) {
+        if (previous?.isConnected && postId(previous) === id)
+            return previous;
+        const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
+        return Array.from(root?.querySelectorAll('article') ?? []).find(article => article.isConnected && postId(article) === id);
+    }
+    const accountLabel = () => document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]')?.textContent ?? '';
+    function showSpecialStatus(id, text) {
+        specialStatus.set(id, text);
+        const article = currentArticle(id);
+        const row = article && Array.from(article.querySelectorAll(`[${marker}]`)).find(node => node.closest('article') === article);
+        const status = row?.querySelector('[role="status"]');
+        if (status)
+            status.textContent = text;
+        schedule();
+    }
     function refresh(button, article) {
-        const active = !!control(article, 'unlike') && !!control(article, 'removeBookmark');
+        const id = postId(article) ?? '';
+        const active = !!control(article, 'unlike') && !!control(article, 'removeBookmark') && !folderConfigured;
         const pressed = String(active);
         if (button.getAttribute('aria-pressed') !== pressed)
             button.setAttribute('aria-pressed', pressed);
-        const text = busy.has(article) ? '設定中...' : active ? '特別保存済み' : '特別保存';
+        const text = busy.has(id) ? '設定中...' : active ? '特別保存済み' : '特別保存';
         if (button.textContent !== text)
             button.textContent = text;
-        button.disabled = busy.has(article);
+        button.disabled = busy.has(id);
     }
-    async function activateControl(article, id, off, on, label) {
-        if (!enabled() || !article.isConnected || postId(article) !== id)
-            throw new Error('投稿が変わりました。再度お試しください。');
-        if (control(article, on))
+    async function activateControl(article, id, off, on, label, account) {
+        const live = currentArticle(id, article);
+        if (!enabled() || !live || accountLabel() !== account)
+            throw new Error('投稿・アカウントが変わりました。再度お試しください。');
+        if (control(live, on))
             return;
-        const target = control(article, off);
+        const target = control(live, off);
         if (!target || target.getAttribute('aria-disabled') === 'true' || target.disabled)
             throw new Error(`${label}の操作ボタンを確認できません。`);
         target.click();
         for (let attempt = 0; attempt < 25; attempt++) {
             await new Promise(resolve => setTimeout(resolve, 100));
-            if (!enabled() || !article.isConnected || postId(article) !== id)
-                throw new Error('投稿が変わりました。再度お試しください。');
-            if (control(article, on))
+            if (!enabled() || accountLabel() !== account)
+                throw new Error('アカウントが変わりました。再度お試しください。');
+            const updated = currentArticle(id, article);
+            if (updated && control(updated, on))
                 return;
         }
         throw new Error(`${label}の反映を確認できません。状態を確認して再試行してください。`);
@@ -86,38 +121,60 @@
             cleanup();
             return;
         }
-        if (postId(article) !== id) {
+        if (postId(article) !== id || busy.has(id)) {
             schedule();
             return;
         }
-        busy.add(article);
+        const account = accountLabel();
+        busy.add(id);
         refresh(button, article);
-        status.textContent = '';
+        showSpecialStatus(id, 'いいね・ブックマークを設定しています...');
         try {
+            await folderReady;
             const errors = [];
+            let bookmarked = false;
             for (const [off, on, label] of [['like', 'unlike', 'いいね'], ['bookmark', 'removeBookmark', 'ブックマーク']]) {
                 try {
-                    await activateControl(article, id, off, on, label);
+                    await activateControl(article, id, off, on, label, account);
+                    if (off === 'bookmark')
+                        bookmarked = true;
                 }
                 catch (error) {
                     errors.push(error instanceof Error ? error.message : String(error));
                 }
             }
-            if (postId(article) !== id)
-                return;
-            status.textContent = errors.length ? errors.join(' ') : 'いいね・ブックマーク済み';
+            let folderName;
+            if (folderConfigured && bookmarked) {
+                try {
+                    if (!enabled() || accountLabel() !== account)
+                        throw new Error('アカウントが変わりました。再度お試しください。');
+                    showSpecialStatus(id, '指定フォルダへ登録しています...');
+                    const response = await chrome.runtime.sendMessage({ type: 'SPECIAL_SAVE_FOLDER', postId: id });
+                    if (accountLabel() !== account)
+                        throw new Error('アカウントが変わりました。Xで保存状態を確認してください。');
+                    if (!response?.ok)
+                        throw new Error(response?.error ?? 'フォルダ登録の応答を確認できません。');
+                    folderName = response.folder?.name;
+                    if (!response.configured)
+                        errors.push('このログインにはフォルダ登録先が設定されていません。通常のブックマークのみ保存しました。');
+                }
+                catch (error) {
+                    errors.push(`フォルダ登録: ${error instanceof Error ? error.message : String(error)}`);
+                }
+            }
+            showSpecialStatus(id, errors.length ? errors.join(' ') : folderName ? `いいね・ブックマーク済み / フォルダ「${folderName}」に登録済み` : 'いいね・ブックマーク済み');
         }
         catch (error) {
             if (!enabled()) {
                 cleanup();
                 return;
             }
-            if (postId(article) === id)
-                status.textContent = error instanceof Error ? error.message : String(error);
+            showSpecialStatus(id, error instanceof Error ? error.message : String(error));
         }
         finally {
-            busy.delete(article);
+            busy.delete(id);
             refresh(button, article);
+            schedule();
         }
     }
     async function localSave(button, status, article, id) {
@@ -194,6 +251,9 @@
             if (existing && existing.getAttribute(marker) === id && group) {
                 if (existing.parentElement !== group)
                     group.appendChild(existing);
+                const status = existing.querySelector('[role="status"]');
+                if (status && specialStatus.has(id))
+                    status.textContent = specialStatus.get(id);
                 refresh(existing.querySelector('button'), article);
                 continue;
             }
@@ -212,6 +272,7 @@
             status.setAttribute('role', 'status');
             status.setAttribute('aria-live', 'polite');
             status.style.cssText = 'font-size:12px;overflow-wrap:anywhere;';
+            status.textContent = specialStatus.get(id) ?? '';
             row.append(button, status);
             const localButton = document.createElement('button');
             localButton.type = 'button';
