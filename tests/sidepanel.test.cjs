@@ -35,7 +35,7 @@ function harness({ get, sendMessage } = {}) {
     tabs: { query: async () => [{ id: 1, url: 'https://x.com/home' }] },
     storage: { local: { get: get ?? (async () => ({})), set: async () => {} } },
     runtime: { openOptionsPage: async () => {}, sendMessage: async message => {
-      if (message.type === 'GET_SAVE_STATUS') return { ok: true };
+      if (message.type === 'GET_SAVE_STATUS' || message.type === 'GET_MEDIA_SEARCH_STATUS') return { ok: true };
       if (message.type === 'GET_UNREAD_FILTER') return { ok: true, enabled: false, ids: [] };
       messages.push(message);
       return sendMessage ? sendMessage(message) : { ok: true, removed: 1 };

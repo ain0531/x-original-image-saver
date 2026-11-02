@@ -272,6 +272,64 @@ async function refreshProgress(): Promise<void> {
 void refreshProgress();
 setInterval(() => { if (watchProgress) void refreshProgress(); }, 1000);
 
+const mediaSearchInput = document.getElementById('media-search-id') as HTMLInputElement | null;
+const mediaSearchStartButton = document.getElementById('media-search-start') as HTMLButtonElement | null;
+const mediaSearchStopButton = document.getElementById('media-search-stop') as HTMLButtonElement | null;
+const mediaSearchOpenButton = document.getElementById('media-search-open') as HTMLButtonElement | null;
+const mediaSearchStatus = document.getElementById('media-search-status');
+let searchRequest = false;
+let searchActive = false;
+function renderSearch(response: any): void {
+  const job = response?.job;
+  searchActive = job?.status === 'running' || response?.busy === true;
+  const progress = job && job.via !== 'history' ? `${job.posts}件の投稿を検索しました（${job.pages}ページ）` : '';
+  const lines = !job ? [] : job.status === 'found'
+    ? [`見つかりました: ${job.query}`, job.via === 'history' ? '記録済みの対応から表示しました（Xへの通信なし）。' : progress, `https://x.com/i/status/${job.postId}`]
+    : job.status === 'not-found' ? [`ブックマークの末尾まで検索しましたが見つかりませんでした: ${job.query}`, progress]
+    : job.status === 'running' ? [`検索中: ${job.query}`, progress + '…']
+    : [`停止: ${job.query}`, progress, job.error ?? ''];
+  if (mediaSearchStatus) mediaSearchStatus.textContent = lines.filter(Boolean).join('\n');
+  if (mediaSearchStartButton) mediaSearchStartButton.disabled = searchRequest || searchActive;
+  if (mediaSearchStopButton) mediaSearchStopButton.disabled = !searchActive;
+  if (mediaSearchOpenButton) mediaSearchOpenButton.hidden = job?.status !== 'found';
+}
+async function searchCommand(message: Record<string, unknown>): Promise<void> {
+  searchRequest = true;
+  if (mediaSearchStartButton) mediaSearchStartButton.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage(message);
+    if (!response?.ok) throw new Error(response?.error ?? '応答がありません。');
+    searchRequest = false;
+    renderSearch(response);
+  } catch (error) {
+    searchRequest = false;
+    renderSearch(await chrome.runtime.sendMessage({ type: 'GET_MEDIA_SEARCH_STATUS' }).catch(() => undefined));
+    if (mediaSearchStatus) mediaSearchStatus.textContent = `エラー: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+mediaSearchStartButton?.addEventListener('click', () => {
+  if (searchRequest || searchActive) return;
+  const query = mediaSearchInput?.value.trim() ?? '';
+  if (!query) { if (mediaSearchStatus) mediaSearchStatus.textContent = '画像の固有IDを入力してください。'; return; }
+  void (async () => {
+    const activeTab = await getActiveTab();
+    if (!activeTab?.id) { if (mediaSearchStatus) mediaSearchStatus.textContent = '開いているタブを確認できません。'; return; }
+    if (mediaSearchStatus) mediaSearchStatus.textContent = '検索を開始しています。必要な場合はブックマークの取得用タブを一時的に開き、通信後に自動で閉じます...';
+    await searchCommand({ type: 'START_MEDIA_SEARCH', tabId: activeTab.id, query });
+  })();
+});
+mediaSearchStopButton?.addEventListener('click', () => { void searchCommand({ type: 'STOP_MEDIA_SEARCH' }); });
+mediaSearchOpenButton?.addEventListener('click', () => { void searchCommand({ type: 'OPEN_MEDIA_SEARCH_RESULT' }); });
+async function refreshSearch(): Promise<void> {
+  if (searchRequest) return;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'GET_MEDIA_SEARCH_STATUS' });
+    if (response?.ok) renderSearch(response);
+  } catch { /* The next poll retries. */ }
+}
+void refreshSearch();
+setInterval(() => { if (searchActive) void refreshSearch(); }, 1000);
+
 document.getElementById('open-options')?.addEventListener('click', () => {
   void chrome.runtime.openOptionsPage().catch(error => setStatus(`オプションを開けません: ${error instanceof Error ? error.message : String(error)}`));
 });
