@@ -2,6 +2,9 @@ import { isOriginalDownload, isMediaDownload, parseMediaUrl, mediaKey, historyKe
 const HISTORY_PREFIX = "savedImage:";
 const MIGRATED = "imageHistoryMigratedV2";
 const INDEXED = 'imageHistoryDownloadIndexV1';
+// mediaPost:<mediaKey> → post ID, for every file seen in bookmarks or saves.
+const POST_INDEX_PREFIX = 'mediaPost:';
+const postIndexKey = (media) => POST_INDEX_PREFIX + mediaKey(media);
 export class ImageHistory {
     async migrate() {
         const stored = await chrome.storage.local.get([MIGRATED, "savedMediaMap", "savedMediaKeys"]);
@@ -113,7 +116,34 @@ export class ImageHistory {
             throw new Error("保存ファイルの完了・形式・存在を確認できません。");
         await chrome.storage.local.set({ [historyKey(media)]: {
                 savedAt: Date.now(), quality: media.kind === 'video' ? 'best-mp4' : 'orig', downloadId, url: item.url, ...(media.kind === 'video' ? { bitrate: media.bitrate } : {}),
+                ...(media.postId ? { postId: media.postId } : {}),
             } });
+    }
+    // Index every file seen with its post, and add the post to saved records that lack it.
+    // The index is a lookup for search only; it never creates a saved state.
+    async rememberPosts(media) {
+        const known = media.filter(m => m.postId && /^\d+$/.test(m.postId));
+        if (!known.length)
+            return;
+        await this.ensure();
+        const stored = await chrome.storage.local.get([...known.map(historyKey), ...known.map(postIndexKey)]);
+        const rows = {};
+        for (const m of known) {
+            const record = stored[historyKey(m)];
+            if (record && !record.postId)
+                rows[historyKey(m)] = { ...record, postId: m.postId };
+            if (stored[postIndexKey(m)] !== m.postId)
+                rows[postIndexKey(m)] = m.postId;
+        }
+        if (Object.keys(rows).length)
+            await chrome.storage.local.set(rows);
+    }
+    async postOf(mediaId) {
+        await this.ensure();
+        const records = [HISTORY_PREFIX + mediaId, 'savedVideo:' + mediaId];
+        const index = [POST_INDEX_PREFIX + mediaId, POST_INDEX_PREFIX + 'video:' + mediaId];
+        const stored = await chrome.storage.local.get([...records, ...index]);
+        return [...records.map(key => stored[key]?.postId), ...index.map(key => stored[key])].find(id => typeof id === 'string' && /^\d+$/.test(id));
     }
     async clear() {
         await this.ensure();

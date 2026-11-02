@@ -11,7 +11,7 @@
         overflow-wrap: anywhere;
       }
 
-      input[type="number"] {
+      input[type="number"], input[type="text"] {
         box-sizing: border-box;
         width: 100%;
         min-width: 0;
@@ -102,6 +102,16 @@
           <input id="check-all-saved-list" type="checkbox" checked disabled />
           メディアIDで保存済みを確認（常に有効）
         </label>
+      </div>
+
+      <div class="action-row">
+        <label class="action-option" for="media-search-id">画像IDからブックマークの投稿を検索</label>
+        <input id="media-search-id" type="text" placeholder="例: GxAbCdEf123 / GxAbCdEf123_orig.jpg / 画像URL" autocomplete="off" spellcheck="false" />
+        <button id="media-search-start" type="button">検索</button>
+        <button id="media-search-stop" type="button" disabled>検索を中止</button>
+        <button id="media-search-open" type="button" hidden>見つけた投稿をもう一度開く</button>
+        <p style="margin:0;font-size:12px;color:#333">保存履歴に投稿の記録があればすぐに開きます。記録がない場合はブックマークを新しい順に読み、見つけた投稿を別ウィンドウで表示します。</p>
+        <div id="media-search-status" role="status" aria-live="polite" style="font-size:12px;color:#333;white-space:pre-wrap"></div>
       </div>
 
       <div class="action-row">

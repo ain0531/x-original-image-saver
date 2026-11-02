@@ -2,7 +2,9 @@ import { SaveJobs, PostSaveQueue } from './jobs.js';
 import { errorText, isXPage } from './media.js';
 import { ReadPosts } from './read-posts.js';
 import { BookmarkFolders } from './bookmark-folders.js';
+import { MediaSearch } from './media-search.js';
 const saves = new SaveJobs();
+const mediaSearch = new MediaSearch();
 const localSaves = new PostSaveQueue();
 const readPosts = new ReadPosts();
 const bookmarkFolders = new BookmarkFolders();
@@ -56,6 +58,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void operation.then(result => sendResponse({ ok: true, ...result }), error => sendResponse({ ok: false, error: errorText(error) }));
     return true;
   }
+  if (['START_MEDIA_SEARCH', 'STOP_MEDIA_SEARCH', 'GET_MEDIA_SEARCH_STATUS', 'OPEN_MEDIA_SEARCH_RESULT'].includes(message?.type)) {
+    const allowed = trustedPanel && (message.type !== 'START_MEDIA_SEARCH' || Number.isInteger(message.tabId) && message.tabId >= 0 && typeof message.query === 'string' && message.query.length <= 2000);
+    if (!allowed) { sendResponse({ ok: false, error: 'この画面からの要求は受け付けられません。' }); return false; }
+    const operation = (async () => {
+      if (message.type === 'GET_MEDIA_SEARCH_STATUS') return mediaSearch.status();
+      if (message.type === 'START_MEDIA_SEARCH') {
+        // Both read the same bookmark session; one reader at a time keeps their first pages apart.
+        const save = await saves.status();
+        if (save.job?.status === 'running' || save.busy && save.job?.source === 'direct' && !save.job.sourceDone) throw new Error('保存処理中は検索できません。保存の完了または一時停止を待ってから検索してください。');
+      }
+      return mediaSearch.command(message);
+    })();
+    void operation.then(result => sendResponse({ ok: true, ...result }), error => sendResponse({ ok: false, error: errorText(error) }));
+    return true;
+  }
   const types = ['SAVE_ALL_VISIBLE_IMAGES', 'SAVE_ACCOUNT_MEDIA', 'SAVE_CURRENT_TWEET_IMAGES', 'CLEAR_SAVED_HISTORY', 'GET_SAVE_STATUS', 'PAUSE_SAVE', 'RESUME_SAVE'];
   if (!types.includes(message?.type)) return false;
   if (!trustedPanel) {
@@ -64,6 +81,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const operation = (async () => {
     if (message.type === 'GET_SAVE_STATUS') return { ...await saves.status(), localQueue: await localSaves.summary() };
     if (message.type === 'CLEAR_SAVED_HISTORY' && (await localSaves.summary()).pending) throw new Error('ローカル保存の予約が完了してから履歴を消去してください。');
+    if (['SAVE_ALL_VISIBLE_IMAGES', 'SAVE_ACCOUNT_MEDIA', 'RESUME_SAVE'].includes(message.type) && mediaSearch.searching()) throw new Error('ブックマーク検索中です。検索の完了または中止を待ってから保存してください。');
     return saves.command(message);
   })();
   void operation.then(result => sendResponse({ ok: true, ...result }), error => sendResponse({ ok: false, error: errorText(error) }));

@@ -287,6 +287,8 @@ export class DirectBookmarks {
         }
         return { storeId, scope: identity.scope };
     }
+    // A resumed reader starts from its own cursor and never uses the verified first page.
+    discardInitial(scope) { this.initialPages.delete(scope); }
     async check(storeId, expectedScope) {
         if ((await this.identity(storeId)).scope !== expectedScope)
             throw new Error('Xのログイン・アカウントが変わりました。元のアカウントで再開してください。');
