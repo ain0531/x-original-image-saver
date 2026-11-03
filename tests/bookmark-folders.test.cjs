@@ -76,6 +76,22 @@ test('refusals identify the stage, HTTP status and X code without exposing crede
   assert.equal(verification.ok, false); assert.match(verification.error, /フォルダ登録確認.*code 88: Rate limit exceeded/);
   assert.ok(!verification.error.includes('契約状態'));
 });
+test('X code 29 timeouts on folder reads are retried, but mutations are not resent', async () => {
+  const timeout = { body: { errors: [{ code: 29, message: 'Timeout: Unspecified' }] } };
+  const h = folderReader(); await h.learn();
+  h.replies.push(timeout, timeout, { body: list([{ id: '10', name: '資料' }]) });
+  assert.equal((await h.run('list')).folders[0].id, '10'); assert.equal(h.calls.length, 3);
+  h.calls.length = 0;
+  h.replies.push({ body: { data: { bookmark_collection_tweet_put: 'Done' } } }, timeout, { body: list([{ id: '10', name: '資料', contains_requested_tweet: true }]) });
+  assert.equal((await h.run('add', '10', '202')).verified, true); assert.equal(h.calls.length, 3);
+  h.calls.length = 0;
+  h.replies.push(timeout, timeout, timeout, timeout);
+  const exhausted = await h.run('list');
+  assert.equal(exhausted.ok, false); assert.match(exhausted.error, /フォルダ一覧取得.*code 29/); assert.equal(h.calls.length, 4);
+  h.calls.length = 0; h.replies.length = 0;
+  h.replies.push(timeout);
+  assert.equal((await h.run('add', '10', '202')).ok, false); assert.equal(h.calls.length, 1);
+});
 test('X bookmark entitlement rejection is distinct from missing folders and blocks even partial data', async () => {
   for (const withData of [false, true]) {
     const h = folderReader(); await h.learn();

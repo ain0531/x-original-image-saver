@@ -84,6 +84,8 @@ MAIN worldの `bookmark-folder-reader` をdocument_startおよびバックグラ
 
 指定投稿ID・フォルダIDで `bookmarkTweetToFolder` を実行し、 `bookmark_collection_tweet_put === "Done"` を確認する。その後、 `BookmarkFoldersSlice` にtweet_idを指定して所属を読み戻す。指定フォルダの `contains_requested_tweet === true` が確認できた場合だけ登録済みと表示する。次ページのフォルダも確認し、反映待ちは最大3回・300ms間隔で再照会する。完了応答だけ・通常ブックマーク状態だけでは成功と扱わない。
 
+`BookmarkFoldersSlice`（一覧取得・所属確認）がHTTP 200でGraphQLエラー code 29（Timeout）だけを返した場合は、X側の一時的なタイムアウトとして0.5秒・1.5秒・3秒の間隔で最大3回再照会する。他のエラーを含む応答、HTTPエラー、`bookmarkTweetToFolder`（登録操作）は再送しない。
+
 送信元の拡張ID・メインフレーム・X URL・投稿IDを検証し、送信元タブを使う。設定要求は拡張のオプションURLに限定する。アカウント変更を操作前後で確認し、フォルダ消失・通信エラー・必要なデータが欠けるGraphQLエラー・所属不明時は成功と扱わない。XのWebクライアントと同様に、必要なデータを含む部分的なGraphQLエラーは許容する。失敗時は一覧取得・登録・登録確認の段階、HTTPステータス、操作名、最大3件のエラーコード（extensions.codeまたはcode）とメッセージを表示する。メッセージから認証情報を除去し、レスポンス全体は返さない。GETもPOSTもcontent-typeはapplication/jsonとする。いいね・通常のブックマークはフォルダ登録失敗時も解除しない。
 
 現在のXの公開JSで操作定義とcontains_requested_tweetの用途を確認済み。自動テストは通信を模擬し、実アカウントへの登録結果の確認とは区別する。
