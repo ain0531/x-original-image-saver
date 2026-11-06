@@ -5,6 +5,9 @@ export const BOOKMARK_FOLDER_KEY = 'specialSaveBookmarkFolders';
 type Selection = { id: string; name: string };
 export class BookmarkFolders {
   private captures: Promise<void> = Promise.resolve();
+  // X rejects overlapping folder requests, so consecutive special saves (and
+  // option-page listings) reach X one at a time in arrival order.
+  private queue: Promise<unknown> = Promise.resolve();
   private authentication = new Map<string, { at: number; headers: Record<string, string> }>();
   constructor() {
     // Observe the actual Web client's headers even when its fetch reference was
@@ -43,6 +46,11 @@ export class BookmarkFolders {
       }
       throw new Error('X標準通信の認証情報を自動取得できませんでした。フォルダ通信は開始していません。');
     } finally { if (tab.id !== undefined) await chrome.tabs.remove(tab.id).catch(() => {}); }
+  }
+  private serial<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(task);
+    this.queue = result.catch(() => {});
+    return result;
   }
   async clear() { await chrome.storage.local.remove(BOOKMARK_FOLDER_KEY); return {}; }
   private async settingsAccount(tabId: number, identity: { storeId: string; scope: string }): Promise<string> {
@@ -89,14 +97,17 @@ export class BookmarkFolders {
     if (result.templates) await chrome.storage.session.set({ [cacheKey]: { at: Date.now(), templates: result.templates } });
     return result;
   }
-  async list(tabId: number) {
+  list(tabId: number) { return this.serial(() => this.listNow(tabId)); }
+  select(tabId: number, expectedAccount: string, folderId: string) { return this.serial(() => this.selectNow(tabId, expectedAccount, folderId)); }
+  add(tabId: number, postId: string) { return this.serial(() => this.addNow(tabId, postId)); }
+  private async listNow(tabId: number) {
     const identity = await directBookmarks.login(tabId);
     const account = await this.settingsAccount(tabId, identity);
     const result = await this.run(tabId, 'list', identity);
     return { folders: result.folders as BookmarkFolder[], account, selected: await this.selection(account, identity.scope) };
   }
-  async select(tabId: number, expectedAccount: string, folderId: string) {
-    const current = await this.list(tabId);
+  private async selectNow(tabId: number, expectedAccount: string, folderId: string) {
+    const current = await this.listNow(tabId);
     if (current.account !== expectedAccount) throw new Error('Xのアカウントが変わりました。一覧を読み込み直してください。');
     const folder = current.folders.find(folder => folder.id === folderId);
     if (folderId && !folder) throw new Error('指定されたフォルダは存在しません。一覧を更新してください。');
@@ -105,7 +116,7 @@ export class BookmarkFolders {
     await chrome.storage.local.set({ [BOOKMARK_FOLDER_KEY]: stored });
     return { selected: folder };
   }
-  async add(tabId: number, postId: string) {
+  private async addNow(tabId: number, postId: string) {
     const identity = await directBookmarks.login(tabId);
     const account = await this.settingsAccount(tabId, identity);
     const selected = await this.selection(account, identity.scope);

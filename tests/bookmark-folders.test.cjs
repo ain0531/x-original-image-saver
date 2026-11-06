@@ -76,6 +76,22 @@ test('refusals identify the stage, HTTP status and X code without exposing crede
   assert.equal(verification.ok, false); assert.match(verification.error, /フォルダ登録確認.*code 88: Rate limit exceeded/);
   assert.ok(!verification.error.includes('契約状態'));
 });
+test('X code 29 timeouts on folder reads are retried, but mutations are not resent', async () => {
+  const timeout = { body: { errors: [{ code: 29, message: 'Timeout: Unspecified' }] } };
+  const h = folderReader(); await h.learn();
+  h.replies.push(timeout, timeout, { body: list([{ id: '10', name: '資料' }]) });
+  assert.equal((await h.run('list')).folders[0].id, '10'); assert.equal(h.calls.length, 3);
+  h.calls.length = 0;
+  h.replies.push({ body: { data: { bookmark_collection_tweet_put: 'Done' } } }, timeout, { body: list([{ id: '10', name: '資料', contains_requested_tweet: true }]) });
+  assert.equal((await h.run('add', '10', '202')).verified, true); assert.equal(h.calls.length, 3);
+  h.calls.length = 0;
+  h.replies.push(timeout, timeout, timeout, timeout);
+  const exhausted = await h.run('list');
+  assert.equal(exhausted.ok, false); assert.match(exhausted.error, /フォルダ一覧取得.*code 29/); assert.equal(h.calls.length, 4);
+  h.calls.length = 0; h.replies.length = 0;
+  h.replies.push(timeout);
+  assert.equal((await h.run('add', '10', '202')).ok, false); assert.equal(h.calls.length, 1);
+});
 test('X bookmark entitlement rejection is distinct from missing folders and blocks even partial data', async () => {
   for (const withData of [false, true]) {
     const h = folderReader(); await h.learn();
@@ -172,6 +188,26 @@ test('worker settings and registration use verified login and sender tab, keepin
   assert.equal(saved.ok, true); assert.equal(saved.configured, true);
   const mutation = calls.at(-1); assert.equal(mutation.target.tabId, 1); assert.equal(mutation.args[2], '10'); assert.equal(mutation.args[3], '202');
   assert.equal(h.calls.length, 0);
+});
+test('consecutive special saves register folders one at a time in order and a failure does not stop the queue', async () => {
+  const { h, calls } = folderWorker();
+  const listed = await h.request({ type: 'LIST_BOOKMARK_FOLDERS', tabId: 1 }, optionsSender);
+  await h.request({ type: 'SET_BOOKMARK_FOLDER', tabId: 1, account: listed.account, folderId: '10' }, optionsSender);
+  const execute = h.chrome.scripting.executeScript;
+  let active = 0, peak = 0;
+  h.chrome.scripting.executeScript = async options => {
+    if (options.files) return [];
+    active++; peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active--;
+    if (options.args[0] === 'add' && options.args[3] === '302') return [{ result: { ok: false, error: 'busy' } }];
+    return execute(options);
+  };
+  calls.length = 0;
+  const results = await Promise.all(['301', '302', '303'].map(postId => h.request({ type: 'SPECIAL_SAVE_FOLDER', postId }, postSender)));
+  assert.equal(peak, 1);
+  assert.deepEqual(results.map(result => result.ok), [true, false, true]);
+  assert.deepEqual(calls.filter(call => call.args[0] === 'add').map(call => call.args[3]), ['301', '303']);
 });
 test('worker rejects forged senders, stale accounts and nonexistent folders', async () => {
   const { h, calls } = folderWorker();

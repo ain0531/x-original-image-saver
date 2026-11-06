@@ -49,7 +49,7 @@ function parseTimelineMedia(instructions: any[], includeQuotes: boolean, photoOn
       if (photoOnly && ['video', 'animated_gif'].includes(item.type)) continue;
       if (videoOnly && item.type === 'photo') continue;
       const parsed = tweetMedia(item);
-      if (parsed.media) media.set(mediaKey(parsed.media), parsed.media);
+      if (parsed.media && !media.has(mediaKey(parsed.media))) media.set(mediaKey(parsed.media), /^\d+$/.test(id) ? { ...parsed.media, postId: id } : parsed.media);
       if (parsed.issue) issues.push(`投稿 ${id}: ${parsed.issue}`);
     }
     if (includeQuotes && !quoted && result.quoted_status_result?.result) tweet(result.quoted_status_result.result, true);

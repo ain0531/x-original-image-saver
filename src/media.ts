@@ -1,4 +1,5 @@
-export type Media = { mediaId: string; format: string; origUrl: string; kind?: 'video'; bitrate?: number };
+// postId is the post that carries the file, recorded so a saved ID can be traced back.
+export type Media = { mediaId: string; format: string; origUrl: string; kind?: 'video'; bitrate?: number; postId?: string };
 export function mediaKey(media: Media): string { return media.kind === 'video' ? `video:${media.mediaId}` : media.mediaId; }
 export function historyKey(media: Media): string { return `${media.kind === 'video' ? 'savedVideo:' : 'savedImage:'}${media.mediaId}`; }
 export function isVideoUrl(raw: string): boolean {

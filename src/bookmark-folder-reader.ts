@@ -1,7 +1,7 @@
 // MAIN world: use the logged-in Web client's configuration. Never export credentials.
 (() => {
   const host = window as any;
-  if (host.__xOriginalBookmarkFolders?.version === 6) return;
+  if (host.__xOriginalBookmarkFolders?.version === 7) return;
   const request = window.fetch.bind(window);
   type Config = { url: string; variables: Record<string, unknown>; features?: Record<string, boolean> };
   let headers: Headers | undefined;
@@ -106,7 +106,21 @@
       return [safeCode ? `code ${safeCode}` : '', message].filter(Boolean).join(': ');
     }).filter(Boolean).join(' / ');
   }
+  // X intermittently answers folder reads with GraphQL code 29 "Timeout" (HTTP 200).
+  // Reads are idempotent, so retry those with backoff; mutations are never resent.
+  const transient = (errors: any[]) => errors.length > 0 && errors.every(error => String(error?.extensions?.code ?? error?.code) === '29');
   async function json(url: string, init: RequestInit, stage: string, usable: (body: any) => boolean): Promise<any> {
+    const delays = init.method && init.method !== 'GET' ? [] : [500, 1500, 3000];
+    for (let attempt = 0; ; attempt++) {
+      try { return await jsonOnce(url, init, stage, usable); }
+      catch (error) {
+        if (!(error instanceof TransientError) || attempt >= delays.length) throw error;
+        await new Promise<void>(resolve => setTimeout(resolve, delays[attempt]));
+      }
+    }
+  }
+  class TransientError extends Error {}
+  async function jsonOnce(url: string, init: RequestInit, stage: string, usable: (body: any) => boolean): Promise<any> {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
     try {
       const requestHeaders = new Headers(init.headers); requestHeaders.set('content-type', 'application/json');
@@ -120,7 +134,7 @@
         throw new Error(`Xがフォルダ通信を拒否しました（${stage}・code 37）。通常のブックマークは維持されています。契約状態だけでは原因を特定できないため、拡張の認証・通信条件の調査が必要です。`);
       }
       if (!response.ok || errors.length && !usable(body)) {
-        throw new Error(`Xの${stage}に失敗しました（HTTP ${response.status}・${operationOf(url)}）${detail ? ': ' + detail : '。'}`);
+        throw new (response.ok && transient(errors) ? TransientError : Error)(`Xの${stage}に失敗しました（HTTP ${response.status}・${operationOf(url)}）${detail ? ': ' + detail : '。'}`);
       }
       if (!body || typeof body !== 'object') throw new Error(`Xの${stage}の応答を読み取れません（HTTP ${response.status}）。`);
       return body;
@@ -279,5 +293,5 @@
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
     finally { busy = false; }
   };
-  host.__xOriginalBookmarkFolders.version = 6;
+  host.__xOriginalBookmarkFolders.version = 7;
 })();

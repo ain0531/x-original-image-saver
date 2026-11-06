@@ -261,8 +261,15 @@ export class SaveJobs {
         return this.status();
     }
     async enqueue(page) {
-        const additions = page.media.filter(media => !this.tasks.has(mediaKey(media)));
+        // A current-post snapshot lists files without their post; the selected post carries them.
+        const postId = this.job.source === 'current' ? this.job.postId : undefined;
+        const additions = page.media.filter(media => !this.tasks.has(mediaKey(media))).map(media => media.postId || !postId ? media : { ...media, postId });
         const confirmed = this.job.skip ? await this.history.confirmedMany(additions) : new Map();
+        // Index each file's post for search; older saved records gain it here too.
+        try {
+            await this.history.rememberPosts(additions);
+        }
+        catch { /* Search falls back to bookmarks. */ }
         const rows = {};
         for (const media of additions) {
             const task = { media, state: confirmed.get(mediaKey(media)) != null ? 'skipped' : 'pending' };
