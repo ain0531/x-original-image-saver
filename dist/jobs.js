@@ -48,6 +48,8 @@ export class SaveJobs {
         this.taskPrefix = taskPrefix;
         this.history = sharedHistory;
         this.tasks = new Map();
+        // A wake-up kick with no running job settles at once; only a started run makes the worker busy.
+        this.started = false;
         this.writes = Promise.resolve();
         this.control = Promise.resolve();
         // Wakes idle workers when tasks are added or finished, instead of waiting a full poll.
@@ -136,7 +138,7 @@ export class SaveJobs {
     }
     async perform(message) {
         await this.init();
-        if (this.running && !this.job)
+        if (this.running && !this.started)
             await this.running;
         if (message.type === 'PAUSE_SAVE') {
             if (this.job?.status === 'running') {
@@ -299,13 +301,14 @@ export class SaveJobs {
                 }
                 catch { /* Retry persistence on the next wake. */ }
             }
-        }).finally(() => { this.running = undefined; });
+        }).finally(() => { this.running = undefined; this.started = false; });
     }
     async run() {
         await this.init();
         const job = this.job;
         if (!job || job.status !== 'running')
             return;
+        this.started = true;
         if (job.source !== 'current')
             (job.source === 'account' ? assertAccountMediaScope : assertBookmarkScope)(job.url, job.scope);
         if (job.source === 'direct')

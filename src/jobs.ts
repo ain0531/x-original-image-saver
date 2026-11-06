@@ -47,6 +47,8 @@ export class SaveJobs {
   private tasks = new Map<string, Task>();
   private initialized?: Promise<void>;
   private running?: Promise<void>;
+  // A wake-up kick with no running job settles at once; only a started run makes the worker busy.
+  private started = false;
   private writes: Promise<void> = Promise.resolve();
   private control: Promise<unknown> = Promise.resolve();
   // Wakes idle workers when tasks are added or finished, instead of waiting a full poll.
@@ -116,7 +118,7 @@ export class SaveJobs {
   }
   private async perform(message: any): Promise<any> {
     await this.init();
-    if (this.running && !this.job) await this.running;
+    if (this.running && !this.started) await this.running;
     if (message.type === 'PAUSE_SAVE') {
       if (this.job?.status === 'running') { this.job.status = 'paused'; this.job.endedBy = 'user-paused'; await this.persist(); }
       return this.status();
@@ -213,12 +215,13 @@ export class SaveJobs {
     if (this.running) return;
     this.running = this.run().catch(async error => {
       if (this.job) { this.job.status = 'paused'; this.job.endedBy = errorText(error); try { await this.persist(); } catch { /* Retry persistence on the next wake. */ } }
-    }).finally(() => { this.running = undefined; });
+    }).finally(() => { this.running = undefined; this.started = false; });
   }
   private async run(): Promise<void> {
     await this.init();
     const job = this.job;
     if (!job || job.status !== 'running') return;
+    this.started = true;
     if (job.source !== 'current') (job.source === 'account' ? assertAccountMediaScope : assertBookmarkScope)(job.url, job.scope);
     if (job.source === 'direct') await directBookmarks.check(job.cookieStoreId!, job.scope);
     if (job.source === 'account') await directAccountMedia.check(job.cookieStoreId!, job.scope);

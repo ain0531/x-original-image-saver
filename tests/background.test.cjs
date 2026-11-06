@@ -75,6 +75,16 @@ test('page limit reports partial acquisition and retains cursor for resume', asy
   const result = await h.done(); assert.equal(result.job.endedBy, 'max-rounds'); assert.equal(result.job.status, 'review'); assert.equal(result.job.cursor, 'next');
   h.pages.push(page(['B'])); await h.request({ type: 'RESUME_SAVE' }); const resumed = await h.done(); assert.equal(resumed.stats.success, 2);
 });
+test('resume sent as the message that wakes the worker is not refused as busy', async () => {
+  const first = harness(); first.pages.push(page(['A'], 'next'));
+  await first.request({ type: 'SAVE_ALL_VISIBLE_IMAGES', tabId: 1, scrollSettings: { maxRounds: 1 } });
+  assert.equal((await first.done()).job.status, 'review');
+  // A restarted worker kicks the stored job at startup, then handles the panel message.
+  const h = harness(first.store); h.pages.push(page(['B']));
+  const resumed = await h.request({ type: 'RESUME_SAVE' });
+  assert.equal(resumed.ok, true, resumed.error);
+  assert.equal((await h.done()).stats.success, 2);
+});
 test('twenty-page bookmark batches resume at page 21 and 41 with cumulative progress', async () => {
   const h = harness();
   for (let n = 1; n <= 41; n++) h.pages.push(page(['PAGE_' + n], n < 41 ? 'after-' + n : undefined));
