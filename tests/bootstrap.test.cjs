@@ -24,6 +24,16 @@ test('unknown client initializes from one inactive native tab, closes it and con
   assert.equal(h.createdTabs.length, 1); assert.ok(!h.removedTabs.includes(1));
 });
 
+test('an expired learned route reinitializes from a native tab even after an earlier bootstrap succeeded', async () => {
+  const h = harness(); unknownClient(h); nativeBootstrap(h, page(['A']));
+  assert.equal((await start(h)).ok, true); await h.done();
+  assert.equal(h.createdTabs.length, 1);
+  for (const key of Object.keys(h.session)) if (key.startsWith('bookmarkDirect:')) delete h.session[key];
+  nativeBootstrap(h, page(['B']));
+  assert.equal((await start(h)).ok, true); await h.done();
+  assert.equal(h.createdTabs.length, 2); assert.equal(h.session.bookmarkBootstrapTab, undefined);
+});
+
 test('first data request rejected by X can initialize from native response without a second click', async () => {
   for (const status of [401, 403]) {
     const h = harness(); nativeBootstrap(h, page(['A'])); const fetch = h.context.fetch;
