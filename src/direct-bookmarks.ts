@@ -147,7 +147,7 @@ export class DirectBookmarks {
         return result;
       }
     }
-    throw new Error('Xのブックマーク取得先を確認できません。');
+    throw Object.assign(new Error('Xのブックマーク取得先を確認できません。'), { discovery: true });
   }
   private async cleanupBootstrap(): Promise<void> {
     const stored = (await chrome.storage.session.get(BOOTSTRAP_TAB_KEY))[BOOTSTRAP_TAB_KEY] as { tabId: number } | undefined;
@@ -229,7 +229,9 @@ export class DirectBookmarks {
       const message = error instanceof Error ? error.message : String(error);
       if (/HTTP 429|ログイン/.test(message)) throw error;
       const readyKey = BOOTSTRAP_READY_KEY + storeId;
-      if ((await chrome.storage.session.get(readyKey))[readyKey] === identity.scope) throw error;
+      // A learned route that expired or was dropped can only be rebuilt from a native page, so a
+      // discovery failure may reinitialize again; other errors after a successful bootstrap stop here.
+      if ((await chrome.storage.session.get(readyKey))[readyKey] === identity.scope && !(error as { discovery?: boolean })?.discovery) throw error;
       this.initialPages.set(identity.scope, await this.bootstrap(identity, tabId));
     }
     return { storeId, scope: identity.scope };
