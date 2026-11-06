@@ -40,7 +40,7 @@ test('unread filter requests are accepted only from the side panel and X tabs', 
   assert.equal(h.session.unreadFilter, undefined);
 });
 
-function pageHarness({ enabled = true, ids = [], path = '/home' } = {}) {
+function pageHarness({ enabled = true, ids = [], path = '/home', query = '' } = {}) {
   class Element {
     constructor(tag) { this.tag = tag; this.children = []; this.attributes = {}; this.isConnected = true; const props = {}; this.props = props; this.style = { setProperty: (k, v) => { props[k] = v; }, removeProperty: k => { delete props[k]; } }; }
     get parentElement() { return this.parent ?? null; }
@@ -64,7 +64,7 @@ function pageHarness({ enabled = true, ids = [], path = '/home' } = {}) {
     article.append(link); cell.append(article); column.append(cell); return { cell, article };
   };
   const timeouts = new Map(), messages = [], listeners = [], bridged = []; let nextTimer = 0, mutation, visibilityCallback, observed = new Set(), active = true;
-  const location = { pathname: path, href: 'https://x.com' + path, origin: 'https://x.com' };
+  const location = { pathname: path, href: 'https://x.com' + path + query, origin: 'https://x.com' };
   const document = { documentElement: {}, visibilityState: 'visible', addEventListener() {}, removeEventListener() {}, querySelector: s => column.matches(s) ? column : column.querySelector(s), querySelectorAll: s => column.querySelectorAll(s) };
   const chrome = { runtime: { id: 'test', getManifest: () => { if (!active) throw new Error('invalidated'); return {}; },
     onMessage: { addListener: l => listeners.push(l), removeListener() {} },
@@ -225,4 +225,47 @@ test('returning to the top tells the page filter which posts to drop from X, exc
   p.mutate();
   p.context.scrollY = 0; p.mutate();
   assert.deepEqual(p.bridged.filter(m => m.release), [{ __xOriginalUnread: true, release: ['42'] }]);
+});
+
+test('the search Top tab records and hides read posts, but never releases or opens the new posts bar', async () => {
+  const p = pageHarness({ ids: ['1'], path: '/search', query: '?q=cat&src=typed_query' });
+  const old = p.post('1'), a = p.post('51'), b = p.post('52');
+  const button = new p.column.constructor('div'); button.setAttribute('role', 'button'); button.textContent = '3件のポストを表示'; button.rect = { top: 0, bottom: 50, height: 50 }; p.column.append(button);
+  await p.start();
+  assert.equal(hidden(old.cell), true, 'a post read earlier is hidden below the viewport');
+  p.context.scrollY = 1500;
+  p.see(a.article, 1); p.run(500); p.see(b.article, 1); p.run(500); p.run(1000);
+  assert.deepEqual(plain(p.messages.filter(m => m.type === 'MARK_POSTS_READ')), [{ type: 'MARK_POSTS_READ', postIds: ['51', '52'] }]);
+  b.cell.rect = { top: 1000, bottom: 1200, height: 200 };
+  p.mutate(); p.context.scrollY = 0; p.mutate();
+  assert.equal(hidden(b.cell), false, 'posts read here stay visible after returning to the top');
+  assert.equal(p.bridged.some(m => m.release), false, 'nothing is released on search');
+  assert.equal(button.clicks, undefined);
+  const latest = pageHarness({ ids: ['1'], path: '/search', query: '?q=cat&f=live' });
+  const c = latest.post('1'); await latest.start();
+  assert.equal(hidden(c.cell), false); assert.equal(latest.observed.size, 0);
+  const top = pageHarness({ ids: ['1'], path: '/search', query: '?q=cat&f=top' });
+  const d = top.post('1'); await top.start();
+  assert.equal(hidden(d.cell), true);
+  top.location.href = 'https://x.com/search?q=cat&f=live'; top.mutate();
+  assert.equal(hidden(d.cell), false, 'switching to another tab restores hidden posts');
+});
+
+test('posts read on a search page are hidden when X redraws it from its cache after Back', async () => {
+  const p = pageHarness({ path: '/search', query: '?q=cat&src=typed_query' });
+  const a = p.post('61'), b = p.post('62');
+  await p.start(); p.context.scrollY = 1500;
+  p.see(a.article, 1); p.run(500); p.see(b.article, 1); p.run(500);
+  b.cell.rect = { top: 1000, bottom: 1200, height: 200 };
+  p.mutate();
+  assert.equal(hidden(b.cell), false, 'kept while staying on the page');
+  p.location.pathname = '/user/status/61'; p.location.href = 'https://x.com/user/status/61';
+  p.column.children = []; p.mutate();
+  p.location.pathname = '/search'; p.location.href = 'https://x.com/search?q=cat&src=typed_query';
+  const shown = p.post('61'), below = p.post('62'), fresh = p.post('63');
+  shown.cell.rect = { top: 100, bottom: 300, height: 200 }; fresh.cell.rect = { top: 300, bottom: 500, height: 200 };
+  p.added(shown.cell, below.cell, fresh.cell);
+  assert.equal(hidden(shown.cell), true, 'hidden before paint even on screen right after arriving');
+  assert.equal(hidden(below.cell), true);
+  assert.equal(hidden(fresh.cell), false);
 });

@@ -13,7 +13,13 @@ const cursor = { entryId: 'cursor-bottom-1', content: { entryType: 'TimelineTime
 const body = entries => ({ data: { home: { home_timeline_urt: { instructions: [{ type: 'TimelineClearCache' }, { type: 'TimelineAddEntries', entries }] } } } });
 const ids = data => data.data.home.home_timeline_urt.instructions[1].entries.map(entry => entry.entryId);
 
-function page({ path = '/home', responses = {}, wasOn = false } = {}) {
+const searchUrl = product => 'https://x.com/i/api/graphql/QUERY/SearchTimeline?variables=' + encodeURIComponent(JSON.stringify({ rawQuery: 'cat', count: 20, querySource: 'typed_query', product }));
+const TOP = searchUrl('Top'), LATEST = searchUrl('Latest');
+const prompt = { entryId: 'relevanceprompt-0', content: { entryType: 'TimelineTimelineItem', itemContent: { itemType: 'TimelinePrompt' } } };
+const searchBody = (entries, extra = []) => ({ data: { search_by_raw_query: { search_timeline: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries }, ...extra] } } } } });
+const searchIds = data => data.data.search_by_raw_query.search_timeline.timeline.instructions[0].entries.map(entry => entry.entryId);
+
+function page({ path = '/home', query = '', responses = {}, wasOn = false } = {}) {
   const storage = new Map(wasOn ? [['__xOriginalUnreadOn', '1']] : []);
   const sessionStorage = { getItem: key => storage.get(key) ?? null };
   const listeners = [];
@@ -28,7 +34,7 @@ function page({ path = '/home', responses = {}, wasOn = false } = {}) {
   }
   const fetch = async url => new Response(JSON.stringify(responses[url] ?? {}), { status: 200, headers: { 'content-type': 'application/json' } });
   window.fetch = fetch; window.XMLHttpRequest = XMLHttpRequest;
-  const context = vm.createContext({ window, XMLHttpRequest, location: { pathname: path, href: 'https://x.com' + path, origin: 'https://x.com' }, URL, Response, Request, JSON, Promise, setTimeout, clearTimeout, structuredClone, sessionStorage });
+  const context = vm.createContext({ window, XMLHttpRequest, location: { pathname: path, href: 'https://x.com' + path + query, origin: 'https://x.com' }, URL, Response, Request, JSON, Promise, setTimeout, clearTimeout, structuredClone, sessionStorage });
   context.globalThis = context;
   vm.runInContext(fs.readFileSync('dist/timeline-filter.js', 'utf8'), context);
   return {
@@ -144,4 +150,35 @@ test('posts released at the top are removed from the entries X already holds on 
   p.send({ ids: ['4'], release: ['4'] });
   const fourth = await (await p.fetch(FIRST)).json();
   assert.deepEqual(plain(fourth.data.home.home_timeline_urt.instructions.at(-1)), { type: 'TimelineRemoveEntries', entryIds: ['home-conversation-3'] });
+});
+
+test('read posts are removed from search Top tab responses, but not from the Latest tab or other pages', async () => {
+  const data = searchBody([post('1'), prompt, post('2'), thread('3', '4'), cursor]);
+  const p = page({ path: '/search', query: '?q=cat&src=typed_query', responses: { [TOP]: data, [LATEST]: data } });
+  p.send({ enabled: true, ids: ['1', '3', '4'] });
+  assert.deepEqual(searchIds(await (await p.fetch(TOP)).json()), ['relevanceprompt-0', 'tweet-2', 'cursor-bottom-1']);
+  assert.deepEqual(searchIds(await (await p.fetch(LATEST)).json()), ['tweet-1', 'relevanceprompt-0', 'tweet-2', 'home-conversation-3', 'cursor-bottom-1'], 'the Latest tab is left alone');
+  const raw = JSON.stringify(data);
+  assert.deepEqual(searchIds(JSON.parse(p.xhr(TOP, raw).responseText)), ['relevanceprompt-0', 'tweet-2', 'cursor-bottom-1']);
+  const explicit = page({ path: '/search', query: '?q=cat&f=top', responses: { [TOP]: data } });
+  explicit.send({ enabled: true, ids: ['1'] });
+  assert.deepEqual(searchIds(await (await explicit.fetch(TOP)).json()), ['relevanceprompt-0', 'tweet-2', 'home-conversation-3', 'cursor-bottom-1']);
+  for (const [path, query] of [['/search', '?q=cat&f=live'], ['/home', ''], ['/user', '']]) {
+    const other = page({ path, query, responses: { [TOP]: data } });
+    other.send({ enabled: true, ids: ['1'] });
+    assert.deepEqual(searchIds(await (await other.fetch(TOP)).json()), ['tweet-1', 'relevanceprompt-0', 'tweet-2', 'home-conversation-3', 'cursor-bottom-1'], path + query);
+  }
+});
+
+test('a search page whose posts are all read keeps its last read entry, and search entries are never removed', async () => {
+  const replace = [{ type: 'TimelineReplaceEntry', entry_id_to_replace: 'cursor-bottom-0', entry: cursor }];
+  const FIRST = TOP + '&page=1', SECOND = TOP + '&page=2';
+  const p = page({ path: '/search', query: '?q=cat', responses: { [FIRST]: searchBody([post('1'), post('2')], replace), [SECOND]: searchBody([post('5'), post('6')], replace) } });
+  p.send({ enabled: true, ids: ['1', '2'] });
+  const first = await (await p.fetch(FIRST)).json();
+  assert.deepEqual(searchIds(first), ['tweet-2'], 'cursors arrive in TimelineReplaceEntry, so one post is kept');
+  p.send({ ids: ['5'], release: ['2', '5'] });
+  const second = await (await p.fetch(SECOND)).json();
+  assert.deepEqual(searchIds(second), ['tweet-6']);
+  assert.deepEqual(second.data.search_by_raw_query.search_timeline.timeline.instructions.map(i => i.type), ['TimelineAddEntries', 'TimelineReplaceEntry'], 'X ignores TimelineRemoveEntries on search, so none is added');
 });
