@@ -4,8 +4,11 @@
 // before they are rendered. Posts read on this page stay in X's own list and are not hidden while
 // scrolling back; on home, returning to the very top releases them so they are hidden from then on.
 // Search results are not released while staying on the page: X ignores the removal there, and
-// hiding them one by one in the DOM stalls scrolling. They are left out from the next search, and
-// once the page is left they are hidden when X redraws it from its cache (Back does not refetch).
+// hiding them one by one in the DOM stalls scrolling. They are left out from the next search.
+// Once a target page is left (and X redraws it from its cache, as Back does without refetching),
+// the posts read there are released on both home and search, and everything read is hidden as X
+// draws it, even on screen, during a short window after arriving. A page opened over the
+// timeline (photo viewer, composer) is not a leave: X keeps the timeline, so nothing is released.
 // Posts already painted are only hidden below the visible area, so what is on screen never moves.
 (() => {
   const instance = globalThis as any;
@@ -13,7 +16,7 @@
   instance.__xOriginalUnreadFilter = true;
   const hiddenMarker = 'data-x-original-unread-hidden';
   const READ_DELAY = 500;
-  // After arriving at a search page, X draws it in one go (from its cache on Back, restoring the
+  // After arriving at a target page, X draws it in one go (from its cache on Back, restoring the
   // scroll position); read posts drawn in this window are hidden even on screen, before paint.
   const ARRIVAL_WINDOW = 1000;
   // X's in-timeline "N件のポストを表示" bar. The floating "posted" pill is not matched.
@@ -27,8 +30,12 @@
   let evaluated = new WeakMap<Element, string>();
   const read = new Set<string>();
   const readHere = new Set<string>();
-  const readOnSearch = new Set<string>();
   let lastPage = pageKey();
+  let lastOnTarget = onTarget();
+  // A timeline article seen on the target page, and the page left while it was there: coming back
+  // to that page with the article still attached means an overlay was closed, not a redraw.
+  let anchor: Element | undefined;
+  let leftPage: string | undefined;
   let arrivedAt = 0;
   const pending = new Set<string>();
   const watched = new Set<Element>();
@@ -48,13 +55,23 @@
   }
   function onTarget(): boolean { return onHome() || onSearchTop(); }
   function pageKey(): string { const url = new URL(location.href); return url.pathname + url.search; }
-  // Leaving a search page releases the posts read there; arriving at one opens the arrival window.
+  // Arriving at a target page after leaving one releases the posts read there and opens the arrival
+  // window. Returning from a non-target page with the timeline still attached is an overlay closing.
   function checkPage(): void {
     const page = pageKey();
     if (page === lastPage) return;
-    lastPage = page;
-    readOnSearch.forEach(id => readHere.delete(id)); readOnSearch.clear();
-    if (onSearchTop()) arrivedAt = Date.now();
+    const previous = lastPage, wasTarget = lastOnTarget;
+    lastPage = page; lastOnTarget = onTarget();
+    if (!lastOnTarget) { if (wasTarget) leftPage = previous; return; }
+    const overlay = leftPage === page && !!anchor?.isConnected;
+    leftPage = undefined;
+    if (overlay) return;
+    releaseOnLeave();
+    arrivedAt = Date.now();
+  }
+  function releaseOnLeave(): void {
+    if (readHere.size) bridge({ release: Array.from(readHere) });
+    readHere.clear();
   }
   function postId(article: Element): string | undefined {
     const link = Array.from(article.querySelectorAll('a[href]')).find(link => link.querySelector('time') && link.closest('article') === article);
@@ -66,8 +83,10 @@
   }
   function bridge(data: { enabled?: boolean; ids?: string[]; release?: string[] }): void {
     try {
-      if (data.enabled === true) sessionStorage.setItem('__xOriginalUnreadOn', '1');
-      else if (data.enabled === false) sessionStorage.removeItem('__xOriginalUnreadOn');
+      // localStorage is shared by all tabs, so a newly opened tab also waits for the read list.
+      if (data.enabled === true) localStorage.setItem('__xOriginalUnreadOn', '1');
+      else if (data.enabled === false) localStorage.removeItem('__xOriginalUnreadOn');
+      sessionStorage.removeItem('__xOriginalUnreadOn'); // The flag older versions kept per tab.
     } catch { /* Without the flag, the first response of a page is simply not waited for. */ }
     try { window.postMessage({ __xOriginalUnread: true, ...data }, location.origin); } catch { /* The page filter keeps its last state. */ }
   }
@@ -77,9 +96,10 @@
     return cell.getBoundingClientRect().top >= innerHeight;
   }
   function hideable(id: string): boolean { return read.has(id) && !readHere.has(id); }
-  function hide(article: Element): void {
+  // The marker holds the post ID, so a cell X reuses for another post is recognised.
+  function hide(article: Element, id: string): void {
     const cell = cellOf(article);
-    cell.setAttribute(hiddenMarker, ''); cell.style.setProperty('display', 'none', 'important');
+    cell.setAttribute(hiddenMarker, id); cell.style.setProperty('display', 'none', 'important');
   }
   function unhideAll(): void {
     document.querySelectorAll<HTMLElement>(`[${hiddenMarker}]`).forEach(cell => { cell.removeAttribute(hiddenMarker); cell.style.removeProperty('display'); });
@@ -92,6 +112,17 @@
   function reset(): void {
     for (const article of Array.from(watched)) unwatch(article);
     evaluated = new WeakMap(); unhideAll();
+  }
+  // On a page opened over the timeline X keeps the cells, so hidden posts stay hidden unless X has
+  // reused the cell for another post. Evaluation starts over when the timeline is back.
+  function suspend(): void {
+    for (const article of Array.from(watched)) unwatch(article);
+    evaluated = new WeakMap();
+    document.querySelectorAll<HTMLElement>(`[${hiddenMarker}]`).forEach(cell => {
+      const article = cell.tagName === 'ARTICLE' ? cell : cell.querySelector('article');
+      const id = article ? postId(article) : undefined;
+      if (!id || id !== cell.getAttribute(hiddenMarker)) { cell.removeAttribute(hiddenMarker); cell.style.removeProperty('display'); }
+    });
   }
   function onVisibility(entries: IntersectionObserverEntry[]): void {
     for (const entry of entries) {
@@ -110,7 +141,6 @@
     unwatch(article);
     if (read.has(id)) return;
     read.add(id); readHere.add(id); pending.add(id);
-    if (onSearchTop()) readOnSearch.add(id);
     bridge({ ids: [id] });
     if (flushTimer === undefined) flushTimer = setTimeout(flush, 1000);
   }
@@ -122,6 +152,11 @@
     if (pending.size) flushTimer = setTimeout(flush, 1000);
     void chrome.runtime.sendMessage({ type: 'MARK_POSTS_READ', postIds }).catch(() => {});
   }
+  // Sends the pending reads at once when the tab is hidden (reload, close, switch), not after 1s.
+  function onVisibilityChange(): void {
+    if (document.visibilityState === 'hidden' && flushTimer !== undefined) { clearTimeout(flushTimer); flush(); }
+    schedule();
+  }
   function schedule(): void {
     if (stopped || !enabled || scheduled !== undefined) return;
     scheduled = setTimeout(() => { scheduled = undefined; scan(); }, 80);
@@ -130,10 +165,14 @@
     if (!alive()) { cleanup(); return; }
     if (!enabled) return;
     checkPage();
-    if (!onTarget()) { if (watched.size || document.querySelector(`[${hiddenMarker}]`)) reset(); return; }
+    if (!onTarget()) {
+      if (watched.size || document.querySelector(`[${hiddenMarker}]`)) { if (location.pathname === '/search') reset(); else suspend(); }
+      return;
+    }
     for (const article of Array.from(watched)) if (!article.isConnected) unwatch(article);
     const root = timelineRoot();
     if (!root) return;
+    anchor = root.querySelector('article') ?? anchor;
     checkTop(root);
     for (const article of Array.from(root.querySelectorAll('article'))) evaluate(article);
     if (onHome()) expandNewPosts(root);
@@ -141,7 +180,7 @@
   // Arriving back at the top after scrolling at least one screen releases posts read on this page:
   // those X still keeps rendered below the viewport are hidden now, the rest when X draws them.
   function checkTop(root: Element | null): void {
-    if (!onHome()) { awayFromTop = false; return; }
+    if (!onHome()) return;
     if (scrollY > innerHeight) { awayFromTop = true; return; }
     if (scrollY > 1 || !awayFromTop || !root) return;
     awayFromTop = false;
@@ -162,7 +201,7 @@
     for (const article of Array.from(root.querySelectorAll('article'))) {
       const id = evaluated.get(article);
       const cell = cellOf(article);
-      if (id && hideable(id) && !cell.hasAttribute(hiddenMarker) && belowViewport(cell)) { unwatch(article); hide(article); }
+      if (id && hideable(id) && !cell.hasAttribute(hiddenMarker) && belowViewport(cell)) { unwatch(article); hide(article, id); }
     }
   }
   // Opens the bar only while it is on screen, so reading further down is never interrupted.
@@ -176,7 +215,7 @@
     lastExpand = Date.now();
     button.click();
   }
-  function arriving(): boolean { return onSearchTop() && Date.now() - arrivedAt < ARRIVAL_WINDOW; }
+  function arriving(): boolean { return Date.now() - arrivedAt < ARRIVAL_WINDOW; }
   function timelineRoot(): Element | null {
     return document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
   }
@@ -187,13 +226,16 @@
     evaluated.set(article, id);
     unwatch(article);
     const cell = cellOf(article);
-    if (cell.hasAttribute(hiddenMarker)) { cell.removeAttribute(hiddenMarker); cell.style.removeProperty('display'); }
+    if (cell.hasAttribute(hiddenMarker)) {
+      if (cell.getAttribute(hiddenMarker) === id && hideable(id)) return;
+      cell.removeAttribute(hiddenMarker); cell.style.removeProperty('display');
+    }
     // Fallback for posts X shows from its own list: hide only posts read before this page, in
     // another tab, or before returning to the top. A newly drawn cell is hidden before it is
     // painted when it is below the visible area, or anywhere while at the top (X redraws the top
     // after a jump there and on load, and nothing above can shift), or right after arriving at a
-    // search page.
-    if (read.has(id)) { if (hideable(id) && (belowViewport(cell) || scrollY <= 1 || arriving())) hide(article); }
+    // target page.
+    if (read.has(id)) { if (hideable(id) && (belowViewport(cell) || scrollY <= 1 || arriving())) hide(article, id); }
     else { watched.add(article); visibility.observe(article); }
   }
   // Mutation callbacks run before the next paint, so read posts X adds (including the ones it
@@ -221,7 +263,7 @@
     if (enabled === next) { schedule(); return; }
     enabled = next;
     if (next) { scan(); return; }
-    pending.clear(); read.clear(); readHere.clear(); readOnSearch.clear(); reset();
+    pending.clear(); read.clear(); readHere.clear(); reset();
     if (flushTimer !== undefined) { clearTimeout(flushTimer); flushTimer = undefined; }
   }
   async function load(): Promise<void> {
@@ -247,13 +289,13 @@
     readTimers.forEach(pendingRead => clearTimeout(pendingRead)); readTimers.clear(); watched.clear();
     unhideAll(); bridge({ enabled: false });
     document.removeEventListener('scroll', schedule, true);
-    document.removeEventListener('visibilitychange', schedule);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
     try { chrome.runtime.onMessage.removeListener(onMessage); } catch {}
   }
   if (!alive()) { cleanup(); return; }
   chrome.runtime.onMessage.addListener(onMessage);
   observer.observe(document.documentElement, { childList: true, subtree: true });
   document.addEventListener('scroll', schedule, { capture: true, passive: true });
-  document.addEventListener('visibilitychange', schedule);
+  document.addEventListener('visibilitychange', onVisibilityChange);
   void load().catch(() => bridge({ enabled: false }));
 })();
