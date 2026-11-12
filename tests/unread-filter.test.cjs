@@ -65,18 +65,19 @@ function pageHarness({ enabled = true, ids = [], path = '/home', query = '' } = 
   };
   const timeouts = new Map(), messages = [], listeners = [], bridged = []; let nextTimer = 0, mutation, visibilityCallback, observed = new Set(), active = true;
   const location = { pathname: path, href: 'https://x.com' + path + query, origin: 'https://x.com' };
-  const document = { documentElement: {}, visibilityState: 'visible', addEventListener() {}, removeEventListener() {}, querySelector: s => column.matches(s) ? column : column.querySelector(s), querySelectorAll: s => column.querySelectorAll(s) };
+  const docListeners = {};
+  const document = { documentElement: {}, visibilityState: 'visible', addEventListener(type, listener) { (docListeners[type] ??= []).push(listener); }, removeEventListener() {}, querySelector: s => column.matches(s) ? column : column.querySelector(s), querySelectorAll: s => column.querySelectorAll(s) };
   const chrome = { runtime: { id: 'test', getManifest: () => { if (!active) throw new Error('invalidated'); return {}; },
     onMessage: { addListener: l => listeners.push(l), removeListener() {} },
     sendMessage: async message => { messages.push(message); return message.type === 'GET_UNREAD_FILTER' ? { ok: true, enabled, ids } : { ok: true }; } } };
   class Mutation { constructor(cb) { mutation = cb; } observe() {} disconnect() {} }
   class Intersection { constructor(cb) { visibilityCallback = cb; } observe(el) { observed.add(el); } unobserve(el) { observed.delete(el); } disconnect() { observed.clear(); } }
   const intervals = [];
-  const context = vm.createContext({ document, chrome, location, URL, Element, innerHeight: 800, scrollY: 500, sessionStorage: { setItem() {}, removeItem() {} }, window: { postMessage: (data, origin) => { assert.equal(origin, 'https://x.com'); bridged.push(JSON.parse(JSON.stringify(data))); } }, MutationObserver: Mutation, IntersectionObserver: Intersection,
+  const context = vm.createContext({ document, chrome, location, URL, Element, innerHeight: 800, scrollY: 500, localStorage: { setItem() {}, removeItem() {} }, sessionStorage: { setItem() {}, removeItem() {} }, window: { postMessage: (data, origin) => { assert.equal(origin, 'https://x.com'); bridged.push(JSON.parse(JSON.stringify(data))); } }, MutationObserver: Mutation, IntersectionObserver: Intersection,
     setInterval: cb => { intervals.push(cb); return intervals.length; }, clearInterval() {},
     setTimeout: (cb, ms) => { const id = ++nextTimer; timeouts.set(id, { cb, ms }); return id; }, clearTimeout: id => timeouts.delete(id) });
   const run = ms => { for (const [id, t] of [...timeouts]) if (ms === undefined || t.ms === ms) { timeouts.delete(id); t.cb(); } };
-  return { post, column, messages, bridged, location, observed, context, run,
+  return { document, docListeners, post, column, messages, bridged, location, observed, context, run,
     async start() { vm.runInContext(fs.readFileSync('dist/unread-filter.js', 'utf8'), context); await flush(); },
     mutate() { mutation(); run(80); },
     added(...nodes) { mutation([{ addedNodes: nodes }]); },
@@ -85,6 +86,7 @@ function pageHarness({ enabled = true, ids = [], path = '/home', query = '' } = 
     set active(v) { active = v; }, tick: () => intervals[0]() };
 }
 const hidden = cell => cell.props.display === 'none';
+const go = (p, path, query = '') => { p.location.pathname = path; p.location.href = 'https://x.com' + path + query; };
 test('home timeline hides previously read posts and keeps the post being read visible', async () => {
   const p = pageHarness({ ids: ['1'] });
   const old = p.post('1'), fresh = p.post('2');
@@ -114,10 +116,14 @@ test('filter does nothing outside home, while off, and restores posts when turne
   p.send({ type: 'UNREAD_FILTER_STATE', enabled: false }); assert.equal(hidden(d.cell), false);
   assert.deepEqual(p.bridged.at(-1), { __xOriginalUnread: true, enabled: false });
   p.send({ type: 'UNREAD_FILTER_STATE', enabled: true }); await flush(); assert.equal(hidden(d.cell), true);
-  p.location.pathname = '/user'; p.mutate(); assert.equal(hidden(d.cell), false);
+  p.location.pathname = '/user'; p.mutate(); assert.equal(hidden(d.cell), true, 'X may only be showing a page over the timeline, so hidden posts stay hidden');
   p.location.pathname = '/home'; p.mutate(); assert.equal(hidden(d.cell), true);
   p.active = false; p.tick(); assert.equal(hidden(d.cell), false);
   assert.deepEqual(p.bridged.at(-1), { __xOriginalUnread: true, enabled: false });
+  const reused = pageHarness({ ids: ['1'] }); const e = reused.post('1'); await reused.start();
+  assert.equal(hidden(e.cell), true);
+  reused.location.pathname = '/user'; e.article.children[0].href = 'https://x.com/user/status/2'; reused.mutate();
+  assert.equal(hidden(e.cell), false, 'a cell X reused for another post is restored');
 });
 test('posts read in another tab are hidden on their next render', async () => {
   const p = pageHarness(); const a = p.post('5'); await p.start();
@@ -260,6 +266,7 @@ test('posts read on a search page are hidden when X redraws it from its cache af
   p.mutate();
   assert.equal(hidden(b.cell), false, 'kept while staying on the page');
   p.location.pathname = '/user/status/61'; p.location.href = 'https://x.com/user/status/61';
+  for (const item of [a, b]) item.article.isConnected = false;
   p.column.children = []; p.mutate();
   p.location.pathname = '/search'; p.location.href = 'https://x.com/search?q=cat&src=typed_query';
   const shown = p.post('61'), below = p.post('62'), fresh = p.post('63');
@@ -268,4 +275,61 @@ test('posts read on a search page are hidden when X redraws it from its cache af
   assert.equal(hidden(shown.cell), true, 'hidden before paint even on screen right after arriving');
   assert.equal(hidden(below.cell), true);
   assert.equal(hidden(fresh.cell), false);
+});
+
+test('posts read on home are hidden when X redraws home after the user left it', async () => {
+  const p = pageHarness();
+  const a = p.post('71'), b = p.post('72');
+  await p.start(); p.context.scrollY = 1500;
+  p.see(a.article, 1); p.run(500); p.see(b.article, 1); p.run(500);
+  p.mutate();
+  assert.equal(hidden(a.cell), false, 'kept while staying on the page');
+  go(p, '/notifications');
+  for (const item of [a, b]) item.article.isConnected = false;
+  p.column.children = []; p.mutate();
+  go(p, '/home');
+  const shown = p.post('71'), below = p.post('72'), fresh = p.post('73');
+  shown.cell.rect = { top: 100, bottom: 300, height: 200 }; fresh.cell.rect = { top: 300, bottom: 500, height: 200 };
+  p.added(shown.cell, below.cell, fresh.cell);
+  assert.equal(hidden(shown.cell), true, 'hidden before paint even on screen right after coming back');
+  assert.equal(hidden(below.cell), true);
+  assert.equal(hidden(fresh.cell), false);
+  assert.deepEqual(p.bridged.filter(m => m.release), [{ __xOriginalUnread: true, release: ['71', '72'] }]);
+});
+
+test('opening and closing a page over the home timeline keeps hidden posts hidden and releases nothing', async () => {
+  const p = pageHarness({ ids: ['81'] });
+  const old = p.post('81'), current = p.post('82');
+  await p.start();
+  assert.equal(hidden(old.cell), true);
+  p.context.scrollY = 1500; p.see(current.article, 1); p.run(500);
+  old.cell.rect = { top: -900, bottom: -700, height: 200 };
+  go(p, '/user/status/82/photo/1'); p.mutate();
+  assert.equal(hidden(old.cell), true, 'still hidden while the viewer is open');
+  go(p, '/home'); p.mutate();
+  assert.equal(hidden(old.cell), true, 'a hidden post above the viewport is not brought back');
+  assert.equal(hidden(current.cell), false);
+  assert.equal(p.bridged.some(m => m.release), false);
+  const redrawn = p.post('82'); redrawn.cell.rect = { top: 100, bottom: 300, height: 200 }; p.added(redrawn.cell);
+  assert.equal(hidden(redrawn.cell), false, 'the post read on this page is still not hidden');
+});
+
+test('a page over the search Top tab does not release posts read there or open the arrival window', async () => {
+  const query = '?q=cat&src=typed_query';
+  const p = pageHarness({ path: '/search', query });
+  const a = p.post('91'); await p.start();
+  p.context.scrollY = 1500; p.see(a.article, 1); p.run(500);
+  go(p, '/user/status/91/photo/1'); p.mutate();
+  go(p, '/search', query); p.mutate();
+  const redrawn = p.post('91'); redrawn.cell.rect = { top: 100, bottom: 300, height: 200 }; p.added(redrawn.cell);
+  assert.equal(hidden(redrawn.cell), false);
+  assert.equal(p.bridged.some(m => m.release), false);
+});
+
+test('pending reads are sent at once when the tab is hidden', async () => {
+  const p = pageHarness(); const a = p.post('95'); await p.start();
+  p.see(a.article, 1); p.run(500);
+  assert.equal(p.messages.some(m => m.type === 'MARK_POSTS_READ'), false, 'still waiting for the 1s timer');
+  p.document.visibilityState = 'hidden'; p.docListeners.visibilitychange.forEach(listener => listener());
+  assert.deepEqual(plain(p.messages.filter(m => m.type === 'MARK_POSTS_READ')), [{ type: 'MARK_POSTS_READ', postIds: ['95'] }]);
 });

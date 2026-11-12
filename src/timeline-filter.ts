@@ -10,17 +10,19 @@
   host.__xOriginalTimelineFilter = true;
   const BRIDGE = '__xOriginalUnread';
   const STATE_WAIT = 1500;
-  // Set by unread-filter while the filter is on. Only then does the first response of a page
-  // wait for the read list; while off, nothing is delayed or parsed.
+  // Set by unread-filter (in localStorage, shared by all tabs, so a newly opened tab waits too) while
+  // the filter is on. Only then does the first response of a page wait for the read list; while off,
+  // nothing is delayed or parsed.
   const ON_FLAG = '__xOriginalUnreadOn';
   let wasOn = false;
-  try { wasOn = sessionStorage.getItem(ON_FLAG) === '1'; } catch { /* Storage may be blocked. */ }
+  try { wasOn = localStorage.getItem(ON_FLAG) === '1'; } catch { /* Storage may be blocked. */ }
   let enabled = false;
   let received = false;
   const read = new Set<string>();
   const released = new Set<string>();
-  // Entries X has received: entry ID -> post IDs of each post in it (a repost also by its original).
-  const delivered = new Map<string, string[][]>();
+  // Entries X has received per timeline operation (HomeTimeline / HomeLatestTimeline): entry ID ->
+  // post IDs of each post in it (a repost also by its original).
+  const delivered = new Map<string, Map<string, string[][]>>();
   const MAX_DELIVERED = 5000;
   let markReady: () => void = () => {};
   const ready = new Promise<void>(resolve => { markReady = resolve; });
@@ -37,13 +39,15 @@
     markReady();
   });
   type Kind = 'home' | 'search';
+  type Target = { kind: Kind; timeline: string };
   // Search requests carry the tab in `product`; only "Top" is filtered.
-  const timelineKind = (raw: string): Kind | undefined => {
+  const timelineTarget = (raw: string): Target | undefined => {
     try {
       const url = new URL(raw, location.href);
       const name = url.origin === location.origin ? url.pathname.match(/^\/i\/api\/graphql\/[^/]+\/(HomeTimeline|HomeLatestTimeline|SearchTimeline)$/)?.[1] : undefined;
-      if (name !== 'SearchTimeline') return name ? 'home' : undefined;
-      return JSON.parse(url.searchParams.get('variables') ?? '')?.product === 'Top' ? 'search' : undefined;
+      if (!name) return;
+      if (name !== 'SearchTimeline') return { kind: 'home', timeline: name };
+      return JSON.parse(url.searchParams.get('variables') ?? '')?.product === 'Top' ? { kind: 'search', timeline: name } : undefined;
     } catch { return; }
   };
   const isSearchTop = () => {
@@ -61,15 +65,17 @@
   // Returns the number of removed entries. Entries are removed whole: X keeps the post IDs of
   // a conversation module in its metadata, so a module is dropped only when every post is read.
   // A page is never emptied of posts, or X stops loading; its last read entry is kept instead.
-  const filter = (body: any, kind: Kind): number => {
+  const filter = (body: any, { kind, timeline }: Target): number => {
     const instructions = kind === 'home' ? body?.data?.home?.home_timeline_urt?.instructions : body?.data?.search_by_raw_query?.search_timeline?.timeline?.instructions;
     if (!Array.isArray(instructions)) return 0;
     let removed = 0, kept = 0;
     let lastRemoved: { list: any[]; at: number; entry: any } | undefined;
     // Released entries X already holds are dropped from its list before new ones are recorded.
     const gone: string[] = [];
-    if (kind === 'home' && released.size) for (const [entryId, posts] of delivered) {
-      if (posts.every(ids => ids.some(id => released.has(id)))) { gone.push(entryId); delivered.delete(entryId); }
+    let store = delivered.get(timeline);
+    if (!store) delivered.set(timeline, store = new Map());
+    if (kind === 'home' && released.size) for (const [entryId, posts] of store) {
+      if (posts.every(ids => ids.some(id => released.has(id)))) { gone.push(entryId); store.delete(entryId); }
     }
     for (const instruction of instructions) {
       if (instruction?.type !== 'TimelineAddEntries' || !Array.isArray(instruction.entries)) continue;
@@ -91,21 +97,21 @@
       for (const entry of instruction.entries) {
         const content = entry?.content;
         const posts = (Array.isArray(content?.items) ? content.items.map((item: any) => item?.item) : [content]).map(postIds).filter((ids: string[]) => ids.length);
-        if (typeof entry?.entryId === 'string' && posts.length) { delivered.delete(entry.entryId); delivered.set(entry.entryId, posts); }
+        if (typeof entry?.entryId === 'string' && posts.length) { store.delete(entry.entryId); store.set(entry.entryId, posts); }
       }
     }
-    while (delivered.size > MAX_DELIVERED) delivered.delete(delivered.keys().next().value!);
+    while (store.size > MAX_DELIVERED) store.delete(store.keys().next().value!);
     if (gone.length) instructions.push({ type: 'TimelineRemoveEntries', entryIds: gone });
     return removed + gone.length;
   };
-  const active = (kind: Kind) => enabled && read.size > 0 && (kind === 'home' ? location.pathname === '/home' : isSearchTop());
+  const active = (kind: Kind) => enabled && (kind === 'home' ? location.pathname === '/home' : isSearchTop());
   const nativeFetch = window.fetch;
   window.fetch = async function(this: unknown, input: RequestInfo | URL, init?: RequestInit) {
     const response = await nativeFetch.call(this, input, init);
     if (!response.ok || (!enabled && (received || !wasOn))) return response;
     const url = input instanceof Request ? input.url : String(input);
-    const kind = timelineKind(url);
-    if (!kind) return response;
+    const target = timelineTarget(url);
+    if (!target) return response;
     try {
       // The read list loads asynchronously at page start; wait briefly for it.
       if (!received) {
@@ -113,9 +119,9 @@
         await Promise.race([ready, new Promise<void>(resolve => { timer = setTimeout(resolve, STATE_WAIT); })]);
         clearTimeout(timer);
       }
-      if (!active(kind)) return response;
+      if (!active(target.kind)) return response;
       const body = await response.clone().json();
-      if (!filter(body, kind)) return response;
+      if (!filter(body, target)) return response;
       const filtered = new Response(JSON.stringify(body), { status: response.status, statusText: response.statusText, headers: response.headers });
       Object.defineProperty(filtered, 'url', { value: response.url });
       return filtered;
@@ -135,19 +141,19 @@
     delete (this as any).responseText; delete (this as any).response;
     nextGeneration(this);
     const waiting = !received && wasOn;
-    const kind = enabled || waiting ? timelineKind(String(url)) : undefined;
-    if (kind) {
+    const target = enabled || waiting ? timelineTarget(String(url)) : undefined;
+    if (target) {
       if (waiting) held.add(this);
       let cached: { text: string; json: unknown } | undefined;
       let done = false;
       // The body is parsed at most once, and only while the filter is active.
       const result = (): typeof cached => {
-        if (done || this.readyState !== 4 || this.status < 200 || this.status >= 300 || !active(kind)) return cached;
+        if (done || this.readyState !== 4 || this.status < 200 || this.status >= 300 || !active(target.kind)) return cached;
         done = true;
         try {
           const raw = this.responseType === 'json' ? responseGetter.call(this) : textGetter.call(this);
           const body = typeof raw === 'string' ? JSON.parse(raw) : structuredClone(raw);
-          if (active(kind) && filter(body, kind)) cached = { text: JSON.stringify(body), json: body };
+          if (active(target.kind) && filter(body, target)) cached = { text: JSON.stringify(body), json: body };
         } catch { /* An unreadable response is passed through unchanged. */ }
         return cached;
       };

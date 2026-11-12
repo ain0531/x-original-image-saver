@@ -5,6 +5,7 @@ const vm = require('node:vm');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const plain = value => JSON.parse(JSON.stringify(value));
 const HOME = 'https://x.com/i/api/graphql/QUERY/HomeTimeline?variables=%7B%7D';
+const HOME_LATEST = 'https://x.com/i/api/graphql/QUERY/HomeLatestTimeline?variables=%7B%7D';
 
 const post = (id, extra = {}) => ({ entryId: 'tweet-' + id, content: { entryType: 'TimelineTimelineItem', itemContent: { tweet_results: { result: { rest_id: id, legacy: {}, ...extra } } } } });
 const repost = (id, original) => post(id, { legacy: { retweeted_status_result: { result: { __typename: 'TweetWithVisibilityResults', tweet: { rest_id: original } } } } });
@@ -19,9 +20,11 @@ const prompt = { entryId: 'relevanceprompt-0', content: { entryType: 'TimelineTi
 const searchBody = (entries, extra = []) => ({ data: { search_by_raw_query: { search_timeline: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries }, ...extra] } } } } });
 const searchIds = data => data.data.search_by_raw_query.search_timeline.timeline.instructions[0].entries.map(entry => entry.entryId);
 
-function page({ path = '/home', query = '', responses = {}, wasOn = false } = {}) {
+function page({ path = '/home', query = '', responses = {}, wasOn = false, tabOn = false } = {}) {
   const storage = new Map(wasOn ? [['__xOriginalUnreadOn', '1']] : []);
-  const sessionStorage = { getItem: key => storage.get(key) ?? null };
+  const localStorage = { getItem: key => storage.get(key) ?? null };
+  // The old per-tab flag must not make a page wait.
+  const sessionStorage = { getItem: key => tabOn && key === '__xOriginalUnreadOn' ? '1' : null };
   const listeners = [];
   const window = { addEventListener: (type, listener) => { if (type === 'message') listeners.push(listener); } };
   class XMLHttpRequest {
@@ -34,7 +37,7 @@ function page({ path = '/home', query = '', responses = {}, wasOn = false } = {}
   }
   const fetch = async url => new Response(JSON.stringify(responses[url] ?? {}), { status: 200, headers: { 'content-type': 'application/json' } });
   window.fetch = fetch; window.XMLHttpRequest = XMLHttpRequest;
-  const context = vm.createContext({ window, XMLHttpRequest, location: { pathname: path, href: 'https://x.com' + path + query, origin: 'https://x.com' }, URL, Response, Request, JSON, Promise, setTimeout, clearTimeout, structuredClone, sessionStorage });
+  const context = vm.createContext({ window, XMLHttpRequest, location: { pathname: path, href: 'https://x.com' + path + query, origin: 'https://x.com' }, URL, Response, Request, JSON, Promise, setTimeout, clearTimeout, structuredClone, localStorage, sessionStorage });
   context.globalThis = context;
   vm.runInContext(fs.readFileSync('dist/timeline-filter.js', 'utf8'), context);
   return {
@@ -181,4 +184,38 @@ test('a search page whose posts are all read keeps its last read entry, and sear
   const second = await (await p.fetch(SECOND)).json();
   assert.deepEqual(searchIds(second), ['tweet-6']);
   assert.deepEqual(second.data.search_by_raw_query.search_timeline.timeline.instructions.map(i => i.type), ['TimelineAddEntries', 'TimelineReplaceEntry'], 'X ignores TimelineRemoveEntries on search, so none is added');
+});
+
+test('the wait flag is read from localStorage (shared by tabs), not from the per-tab sessionStorage', async () => {
+  const data = body([post('1'), post('2')]);
+  const old = page({ tabOn: true, responses: { [HOME]: data } });
+  const started = Date.now();
+  assert.deepEqual(ids(await (await old.fetch(HOME)).json()), ['tweet-1', 'tweet-2']);
+  assert.ok(Date.now() - started < 500, 'a sessionStorage flag alone does not make the page wait');
+  const fresh = page({ wasOn: true, responses: { [HOME]: data } });
+  const pending = fresh.fetch(HOME); await flush();
+  fresh.send({ enabled: true, ids: ['1'] });
+  assert.deepEqual(ids(await (await pending).json()), ['tweet-2'], 'a new tab waits for the read list and filters its first response');
+});
+
+test('entries delivered while nothing was read yet can still be released later', async () => {
+  const FIRST = HOME + '&page=1', SECOND = HOME + '&page=2';
+  const p = page({ responses: { [FIRST]: body([post('1'), post('2'), cursor]), [SECOND]: body([post('3'), cursor]) } });
+  p.send({ enabled: true, ids: [] });
+  assert.deepEqual(ids(await (await p.fetch(FIRST)).json()), ['tweet-1', 'tweet-2', 'cursor-bottom-1']);
+  p.send({ ids: ['1'], release: ['1'] });
+  const second = await (await p.fetch(SECOND)).json();
+  assert.deepEqual(plain(second.data.home.home_timeline_urt.instructions.at(-1)), { type: 'TimelineRemoveEntries', entryIds: ['tweet-1'] });
+});
+
+test('released entries are tracked per timeline: a response of the other home tab does not consume them', async () => {
+  const FIRST = HOME + '&page=1', SECOND = HOME + '&page=2';
+  const p = page({ responses: { [FIRST]: body([post('1'), post('2'), cursor]), [HOME_LATEST]: body([post('8'), cursor]), [SECOND]: body([post('3'), cursor]) } });
+  p.send({ enabled: true, ids: ['9'] });
+  await p.fetch(FIRST);
+  p.send({ ids: ['1'], release: ['1'] });
+  const latest = await (await p.fetch(HOME_LATEST)).json();
+  assert.equal(latest.data.home.home_timeline_urt.instructions.some(i => i.type === 'TimelineRemoveEntries'), false, 'the other timeline holds no such entry');
+  const second = await (await p.fetch(SECOND)).json();
+  assert.deepEqual(plain(second.data.home.home_timeline_urt.instructions.at(-1)), { type: 'TimelineRemoveEntries', entryIds: ['tweet-1'] });
 });
