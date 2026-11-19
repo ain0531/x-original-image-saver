@@ -90,10 +90,17 @@ export class SaveJobs {
   storageKeys(): string[] { return this.job ? [this.jobKey, ...[...this.tasks.keys()].map(id => this.key(id))] : [this.jobKey]; }
   async finish(): Promise<any> { this.kick(); await this.running; return this.status(); }
   // Queue snapshots are captured at acceptance, so transfers never need the article again.
-  async captured(id: string, tabId: number, postId: string, snap: Awaited<ReturnType<typeof snapshot>>, preferences: Awaited<ReturnType<typeof getOptions>>, saveAs = false): Promise<void> {
+  async captured(id: string, tabId: number, postId: string, snap: Awaited<ReturnType<typeof snapshot>>, preferences: Awaited<ReturnType<typeof getOptions>>): Promise<void> {
     await this.init();
-    if (this.job) return; // Recover the existing download IDs after a worker restart.
-    this.job = { id, tabId, postId, url: snap.pageUrl, scope: snap.scope, documentId: snap.documentId, source: 'current', status: 'running', rounds: 0, sourceDone: true, endedBy: 'current-post', issues: [], skip: true, settings: settings({}), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs };
+    if (this.job) {
+      // Keep existing download IDs when recovering a local save from an older version.
+      if (this.job.saveAs !== false) {
+        this.job.saveAs = false;
+        await this.persist();
+      }
+      return;
+    }
+    this.job = { id, tabId, postId, url: snap.pageUrl, scope: snap.scope, documentId: snap.documentId, source: 'current', status: 'running', rounds: 0, sourceDone: true, endedBy: 'current-post', issues: [], skip: true, settings: settings({}), stable: 0, folder: preferences.folder, fileName: preferences.fileName, saveAs: false };
     await this.enqueue(domPage(snap));
   }
   private async taskWrite(task: Task): Promise<void> { await chrome.storage.local.set({ [this.key(mediaKey(task.media))]: task }); }
@@ -342,7 +349,7 @@ export class SaveJobs {
 // Shared by the four workers, reserved before the first asynchronous call.
 const active = new Set<string>();
 
-type PostRequest = { id: string; order: number; tabId: number; postId: string; snap: Awaited<ReturnType<typeof snapshot>>; preferences: Awaited<ReturnType<typeof getOptions>>; saveAs?: boolean; state: 'queued' | 'running' | 'finished'; result?: any; keys?: string[] };
+type PostRequest = { id: string; order: number; tabId: number; postId: string; snap: Awaited<ReturnType<typeof snapshot>>; preferences: Awaited<ReturnType<typeof getOptions>>; state: 'queued' | 'running' | 'finished'; result?: any; keys?: string[] };
 const POST_PREFIX = 'localSaveRequest:';
 export class PostSaveQueue {
   private requests = new Map<string, PostRequest>();
@@ -368,13 +375,13 @@ export class PostSaveQueue {
       const snap = await snapshot(tabId, true, postId);
       if (snap.pageUrl !== tab.url || !snap.posts.includes(postId)) throw new Error('指定した投稿を確認できません。タイムラインに投稿を表示して再試行してください。');
       const preferences = await getOptions();
-      const shared = await chrome.storage.local.get(['likeOnSave', 'specifySaveLocation']);
+      const shared = await chrome.storage.local.get('likeOnSave');
       if (shared.likeOnSave === true) {
         try { await likePost(tabId, postId); }
         catch (error) { snap.issues.push(`いいね: ${errorText(error)}`); }
       }
       const order = [...this.requests.values()].reduce((max, row) => Math.max(max, row.order), 0) + 1;
-      const request: PostRequest = { id: String(Date.now()) + '-' + Math.random().toString(36).slice(2), order, tabId, postId, snap, preferences, saveAs: shared.specifySaveLocation === true, state: 'queued' };
+      const request: PostRequest = { id: String(Date.now()) + '-' + Math.random().toString(36).slice(2), order, tabId, postId, snap, preferences, state: 'queued' };
       await this.write(request); // Acknowledge only after the reservation is durable.
       this.requests.set(request.id, request); this.kick();
       return this.status(tabId, postId, request.id);
@@ -413,7 +420,7 @@ export class PostSaveQueue {
       const saves = new SaveJobs('localSaveJob:' + request.id, 'localSaveTask:' + request.id + ':');
       request.state = 'running'; await this.write(request);
       this.current = { request, saves };
-      await saves.captured(request.id, request.tabId, request.postId, request.snap, request.preferences, request.saveAs === true);
+      await saves.captured(request.id, request.tabId, request.postId, request.snap, request.preferences);
       const result = await saves.finish();
       // Keep failures and issues for inspection; they never block the next reservation.
       request.result = result; request.state = 'finished'; request.keys = saves.storageKeys(); await this.write(request);

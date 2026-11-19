@@ -149,7 +149,7 @@ test('instructions are accepted during a transfer, then execute serially from ca
 });
 
 test('restart recovers the current download ID and queued posts without the original tab', async () => {
-  const h = harness({ specifySaveLocation: true }); h.snap.posts = ['202']; h.snap.urls = ['https://pbs.twimg.com/media/A.jpg'];
+  const h = harness({ specifySaveLocation: true }); h.snap.posts = ['202']; h.snap.urls = ['https://pbs.twimg.com/media/A.jpg', 'https://pbs.twimg.com/media/C.jpg'];
   h.cached.push({ postId: '202', complete: true, urls: h.snap.urls });
   const download = h.chrome.downloads.download;
   h.chrome.downloads.download = async options => { const id = await download(options); h.states.get(id).state = 'in_progress'; return id; };
@@ -158,26 +158,35 @@ test('restart recovers the current download ID and queued posts without the orig
   h.snap.posts = ['303']; h.snap.urls = ['https://pbs.twimg.com/media/B.jpg'];
   h.cached.push({ postId: '303', complete: true, urls: h.snap.urls });
   await local(h, '303'); const second = h.ticket;
-  const restored = harness(Object.fromEntries(Object.entries(h.store).reverse()));
+  const legacyStorage = structuredClone(h.store);
+  legacyStorage['localSaveJob:' + first.id].saveAs = true;
+  legacyStorage['localSaveRequest:' + second.id].saveAs = true;
+  const restored = harness(Object.fromEntries(Object.entries(legacyStorage).reverse()));
   const item = structuredClone(h.states.get(1)); item.state = 'complete';
   restored.chrome.downloads.search = async query => query.id === 1 ? [item] : [...restored.states.values()].filter(row => query.id === row.id);
   restored.chrome.downloads.download = async options => {
-    restored.calls.push(options); restored.states.set(2, { id: 2, state: 'complete', exists: true, mime: 'image/jpeg', url: options.url, finalUrl: options.url }); return 2;
+    const id = restored.calls.length + 2;
+    restored.calls.push(options);
+    restored.states.set(id, { id, state: 'complete', exists: true, mime: 'image/jpeg', url: options.url, finalUrl: options.url });
+    return id;
   };
   restored.chrome.tabs.get = async () => { throw new Error('Tab closed'); };
   const firstResult = await done(restored, first);
-  assert.equal(firstResult.stats.success, 1); assert.equal(firstResult.job.saveAs, true);
+  assert.equal(firstResult.stats.success, 2); assert.equal(firstResult.job.saveAs, false);
   assert.equal((await done(restored, second)).stats.success, 1);
-  assert.equal(restored.calls.length, 1); assert.match(restored.calls[0].url, /\/B\?/);
-  assert.equal(restored.calls[0].saveAs, true);
+  assert.deepEqual(restored.calls.map(call => new URL(call.url).pathname), ['/media/C', '/media/B']);
+  assert.deepEqual(restored.calls.map(call => call.saveAs), [false, false]);
   assert.equal(restored.injections.length, 0);
   // Let the simulated old worker exit too.
   h.states.get(1).state = 'complete'; h.chrome.downloads.download = download;
   await done(h, second);
 });
 
-test('local queue uses the shared save-location setting captured at reservation, ignoring later changes', async () => {
-  const h = harness({ specifySaveLocation: true });
+test('local queue saves automatically even when manual selection is enabled in the side panel', async () => {
+  const h = harness({
+    specifySaveLocation: true,
+    imageSaverOptions: { maxPages: 20, maxSeconds: 30, folder: 'Local', fileName: '{mediaId}.{format}' },
+  });
   h.snap.posts = ['202']; h.snap.urls = ['https://pbs.twimg.com/media/A.jpg'];
   h.cached.push({ postId: '202', complete: true, urls: h.snap.urls });
   let release; const gate = new Promise(resolve => { release = resolve; });
@@ -189,24 +198,23 @@ test('local queue uses the shared save-location setting captured at reservation,
   h.snap.posts = ['303']; h.snap.urls = ['https://pbs.twimg.com/media/B.jpg'];
   h.cached.push({ postId: '303', complete: true, urls: h.snap.urls });
   assert.equal((await local(h, '303')).ok, true); const second = h.ticket;
-  assert.equal(h.store['localSaveRequest:' + first.id].saveAs, true);
-  assert.equal(h.store['localSaveRequest:' + second.id].saveAs, false);
   await h.chrome.storage.local.set({ specifySaveLocation: true });
   release();
   assert.equal((await done(h, first)).stats.success, 1);
   assert.equal((await done(h, second)).stats.success, 1);
-  assert.deepEqual(h.calls.map(call => call.saveAs), [true, false]);
+  assert.deepEqual(h.calls.map(call => call.saveAs), [false, false]);
+  assert.deepEqual(h.calls.map(call => call.filename), ['Local/A.jpg', 'Local/B.jpg']);
 });
 
-test('canceling local Save As does not block the next reservation or record the canceled file', async () => {
+test('canceling a local download does not block the next reservation or record the canceled file', async () => {
   const h = harness({ specifySaveLocation: true });
   h.snap.posts = ['202']; h.snap.urls = ['https://pbs.twimg.com/media/A.jpg'];
   h.cached.push({ postId: '202', complete: true, urls: h.snap.urls });
   const download = h.chrome.downloads.download;
-  h.chrome.downloads.download = async options => { if (options.saveAs) throw new Error('USER_CANCELED'); return download(options); };
+  h.chrome.downloads.download = async () => { throw new Error('USER_CANCELED'); };
   await local(h); const first = await done(h);
   assert.equal(first.stats.canceled, 1); assert.equal(first.stats.pending, 0); assert.equal(h.store['savedImage:A'], undefined);
-  await h.chrome.storage.local.set({ specifySaveLocation: false });
+  h.chrome.downloads.download = download;
   await local(h); assert.equal((await done(h)).stats.success, 1);
 });
 
