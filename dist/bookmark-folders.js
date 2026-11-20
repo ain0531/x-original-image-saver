@@ -114,6 +114,44 @@ export class BookmarkFolders {
     list(tabId) { return this.serial(() => this.listNow(tabId)); }
     select(tabId, expectedAccount, folderId) { return this.serial(() => this.selectNow(tabId, expectedAccount, folderId)); }
     add(tabId, postId) { return this.serial(() => this.addNow(tabId, postId)); }
+    bookmark(tabId, postId) {
+        return this.serial(async () => {
+            const identity = await directBookmarks.login(tabId);
+            const source = await chrome.tabs.get(tabId);
+            const detail = await chrome.tabs.create({ windowId: source.windowId, url: `https://x.com/i/web/status/${postId}`, active: false });
+            if (detail.id === undefined)
+                throw new Error('Xの投稿詳細を開けませんでした。');
+            try {
+                for (let attempt = 0; attempt < 60; attempt++) {
+                    const tab = await chrome.tabs.get(detail.id);
+                    const url = tab.url && new URL(tab.url);
+                    if (url && url.origin === 'https://x.com' && url.pathname.match(/\/status\/(\d+)\/?$/)?.[1] === postId) {
+                        const current = await directBookmarks.login(detail.id);
+                        if (current.scope !== identity.scope || current.csrf !== identity.csrf)
+                            throw new Error('Xのアカウントが変わりました。再度お試しください。');
+                        const [injected] = await chrome.scripting.executeScript({
+                            target: { tabId: detail.id }, world: 'MAIN',
+                            func: (id, csrf) => {
+                                const save = window.__xOriginalBookmarkOnDetail;
+                                return typeof save === 'function' ? save(id, csrf) : null;
+                            }, args: [postId, identity.csrf],
+                        });
+                        if (injected?.result) {
+                            if (!injected.result.ok)
+                                throw new Error(injected.result.error ?? '投稿詳細からのブックマーク追加を確認できません。');
+                            await directBookmarks.check(identity.storeId, identity.scope);
+                            return { verified: true };
+                        }
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                }
+                throw new Error('Xの投稿詳細を読み込めませんでした。投稿を開けるか確認してください。');
+            }
+            finally {
+                await chrome.tabs.remove(detail.id).catch(() => { });
+            }
+        });
+    }
     async listNow(tabId) {
         const identity = await directBookmarks.login(tabId);
         const account = await this.settingsAccount(tabId, identity);

@@ -44,6 +44,32 @@ test('folder mutation sends only requested post and folder, preserving native fe
   assert.deepEqual(payload.variables, { bookmark_collection_id: '10', tweet_id: '202' });
   assert.equal(payload.features.native, true);
 });
+test('post detail clicks only the native add control and waits for X to confirm', async () => {
+  for (const scenario of ['saved', 'success', 'failure']) {
+    const h = folderReader();
+    const href = 'https://x.com/user/status/202';
+    Object.assign(h.context.location, { href, pathname: '/user/status/202' });
+    const link = { href, closest: () => article, querySelector: () => ({}) };
+    let testId = scenario === 'saved' ? 'removeBookmark' : 'bookmark';
+    const button = {
+      closest: () => article,
+      getAttribute: name => name === 'data-testid' ? testId : null,
+      click: () => {
+        assert.equal(testId, 'bookmark');
+        testId = 'removeBookmark'; // X can reflect the operation before the request completes.
+        void h.window.fetch('https://x.com/i/api/graphql/FROM_X/CreateBookmark', {
+          method: 'POST', body: JSON.stringify({ variables: { tweet_id: '202' } }),
+        });
+      },
+    };
+    const article = { querySelectorAll: selector => selector === 'a[href]' ? [link] : selector.includes(`"${testId}"`) ? [button] : [] };
+    h.document.querySelector = () => ({ querySelectorAll: () => [article] });
+    h.replies.push(scenario === 'failure' ? { status: 404 } : { body: { data: { tweet_bookmark_put: 'Done' } } });
+    const result = await h.window.__xOriginalBookmarkOnDetail('202', 'csrf-test');
+    assert.equal(result.ok, scenario !== 'failure');
+    assert.equal(h.calls.length, scenario === 'saved' ? 0 : 1);
+  }
+});
 test('HTTP and GraphQL errors and unknown mutation responses never claim success', async () => {
   for (const reply of [{ status: 403 }, { status: 429 }, { body: { errors: [{ message: 'denied' }] } }, { body: { data: {} } }]) {
     const h = folderReader(); await h.learn(); h.replies.push(reply);
@@ -158,6 +184,24 @@ test('XHR templates are captured with the same session boundary', async () => {
 });
 const optionsSender = { id: 'test', url: 'chrome-extension://test/options.html' };
 const postSender = { id: 'test', frameId: 0, url: 'https://x.com/home', tab: { id: 1, url: 'https://x.com/home' } };
+test('ordinary bookmark uses an inactive tab for the requested post and closes it on success or failure', async () => {
+  for (const ok of [true, false]) {
+    const h = harness();
+    h.backgroundSnap.pageUrl = 'https://x.com/user/status/202';
+    h.chrome.cookies.getAllCookieStores = async () => [{ id: '0', tabIds: [1, 2] }];
+    h.chrome.scripting.executeScript = async ({ target, world, args }) => {
+      assert.equal(target.tabId, 2);
+      assert.equal(world, 'MAIN');
+      assert.deepEqual(Array.from(args), ['202', 'csrf-test']);
+      return [{ result: { ok, error: 'Xから確認できません' } }];
+    };
+    const result = await h.request({ type: 'SPECIAL_SAVE_BOOKMARK', postId: '202' }, postSender);
+    assert.equal(result.ok, ok);
+    assert.equal(h.createdTabs[0].url, 'https://x.com/i/web/status/202');
+    assert.equal(h.createdTabs[0].active, false);
+    assert.deepEqual(h.removedTabs, [2]);
+  }
+});
 function folderWorker(capture = true) {
   const h = harness(), calls = [];
   h.chrome.cookies.getAllCookieStores = async () => [{ id: '0', tabIds: Array.from({ length: 100 }, (_, i) => i + 1) }];

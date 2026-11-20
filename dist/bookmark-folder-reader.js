@@ -2,7 +2,7 @@
 // MAIN world: use the logged-in Web client's configuration. Never export credentials.
 (() => {
     const host = window;
-    if (host.__xOriginalBookmarkFolders?.version === 7)
+    if (host.__xOriginalBookmarkFolders?.version === 9)
         return;
     const request = window.fetch.bind(window);
     let headers;
@@ -412,5 +412,61 @@
             busy = false;
         }
     };
-    host.__xOriginalBookmarkFolders.version = 7;
+    host.__xOriginalBookmarkFolders.version = 9;
+    host.__xOriginalBookmarkOnDetail = async (id, csrf) => {
+        const initial = session();
+        const isTarget = () => location.pathname.match(/\/status\/(\d+)\/?$/)?.[1] === id;
+        const check = () => {
+            if (!isTarget() || !csrf || cookie('ct0') !== csrf || session() !== initial)
+                throw new Error('投稿・アカウントが変わりました。再度お試しください。');
+        };
+        const action = (saved) => {
+            const testId = saved ? 'removeBookmark' : 'bookmark';
+            const labels = saved ? ['ブックマークから削除', 'Remove Bookmark', 'Remove from Bookmarks'] : ['ブックマーク', 'ブックマークに追加', 'Bookmark', 'Add to Bookmarks'];
+            const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
+            const article = Array.from(root?.querySelectorAll('article') ?? []).find(candidate => Array.from(candidate.querySelectorAll('a[href]')).some(link => link.closest('article') === candidate && link.querySelector('time') && new URL(link.href, location.href).pathname.match(/\/status\/(\d+)\/?$/)?.[1] === id));
+            return Array.from(article?.querySelectorAll(`[data-testid="${testId}"], button[aria-label], [role="button"][aria-label]`) ?? [])
+                .find(node => node.closest('article') === article && (node.getAttribute('data-testid') === testId || labels.includes(node.getAttribute('aria-label') ?? '')));
+        };
+        const delay = () => new Promise(resolve => setTimeout(resolve, 100));
+        try {
+            check();
+            for (let attempt = 0; attempt < 80; attempt++) {
+                check();
+                if (action(true))
+                    return { ok: true };
+                const button = action(false);
+                if (button && !button.disabled && button.getAttribute('aria-disabled') !== 'true') {
+                    reset();
+                    nativeBookmarks.delete(id);
+                    button.click();
+                    for (let pending = 0; pending < 100; pending++) {
+                        check();
+                        const ticket = nativeBookmarks.get(id);
+                        if (ticket?.account !== initial) {
+                            await delay();
+                            continue;
+                        }
+                        let timer;
+                        try {
+                            await Promise.race([ticket.finished, new Promise((_, reject) => {
+                                    timer = setTimeout(() => reject(new Error('Xのブックマーク保存が時間切れになりました。')), 10000);
+                                })]);
+                        }
+                        finally {
+                            clearTimeout(timer);
+                        }
+                        check();
+                        return { ok: true };
+                    }
+                    throw new Error('投稿詳細からのブックマーク通信を確認できません。Xで保存状態を確認してください。');
+                }
+                await delay();
+            }
+            throw new Error('投稿詳細にブックマークボタンが見つかりません。');
+        }
+        catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+    };
 })();
