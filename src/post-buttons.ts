@@ -4,10 +4,12 @@
   if (instance.__xOriginalPostButtons) return;
   instance.__xOriginalPostButtons = true;
   const marker = 'data-x-original-save';
+  const wrapMarker = 'data-x-original-save-wrap';
   let stopped = false;
   let scheduled: ReturnType<typeof setTimeout> | undefined;
   const busy = new Set<string>();
   const specialStatus = new Map<string, string>();
+  const confirmedBookmarks = new WeakMap<Element, { id: string; account: string }>();
   const localBusy = new WeakSet<Element>();
   const folderKey = 'specialSaveBookmarkFolders';
   let folderConfigured = false;
@@ -22,7 +24,10 @@
     specialStatus.clear();
     schedule();
   });
-  const observer = new MutationObserver(() => schedule());
+  const observer = new MutationObserver(records => {
+    if (records.some(record => record.type === 'childList' || record.attributeName === 'data-testid'
+      || (record.target instanceof Element && record.target.matches(`:has(> [${marker}])`)))) schedule();
+  });
   const timer = setInterval(() => { if (!enabled()) cleanup(); }, 1000);
   function enabled(): boolean {
     try { return !!chrome.runtime.id && !!chrome.runtime.getManifest(); }
@@ -33,6 +38,7 @@
     if (scheduled !== undefined) clearTimeout(scheduled);
     document.querySelectorAll(`[${marker}]`).forEach(node => node.remove());
     document.removeEventListener('visibilitychange', check);
+    window.removeEventListener('resize', schedule);
   }
   function check(): void { if (!enabled()) cleanup(); else schedule(); }
   function schedule(): void {
@@ -64,27 +70,44 @@
   }
   function refresh(button: HTMLButtonElement, article: Element): void {
     const id = postId(article) ?? '';
-    const active = !!control(article, 'unlike') && !!control(article, 'removeBookmark') && !folderConfigured;
+    if (control(article, 'bookmark')) confirmedBookmarks.delete(article);
+    const cached = confirmedBookmarks.get(article);
+    const confirmed = cached?.id === id && cached.account === accountLabel();
+    const active = !!control(article, 'unlike') && (!!control(article, 'removeBookmark') || confirmed) && !folderConfigured;
     const pressed = String(active);
     if (button.getAttribute('aria-pressed') !== pressed) button.setAttribute('aria-pressed', pressed);
     const text = busy.has(id) ? '設定中...' : active ? '特別保存済み' : '特別保存';
     if (button.textContent !== text) button.textContent = text;
     button.disabled = busy.has(id);
   }
+  const unavailable = (label: string) => new Error(`${label}の操作ボタンを確認できません。`);
+  const unconfirmed = (label: string) => new Error(`${label}の反映を確認できません。状態を確認して再試行してください。`);
+  const delay = () => new Promise<void>(resolve => setTimeout(resolve, 100));
+  function clickable(node: HTMLElement | undefined): node is HTMLElement {
+    return !!node && node.getAttribute('aria-disabled') !== 'true' && !(node as HTMLButtonElement).disabled;
+  }
   async function activateControl(article: Element, id: string, off: string, on: string, label: string, account: string): Promise<void> {
     const live = currentArticle(id, article);
     if (!enabled() || !live || accountLabel() !== account) throw new Error('投稿・アカウントが変わりました。再度お試しください。');
     if (control(live, on)) return;
     const target = control(live, off);
-    if (!target || target.getAttribute('aria-disabled') === 'true' || (target as HTMLButtonElement).disabled) throw new Error(`${label}の操作ボタンを確認できません。`);
+    if (!target && off === 'bookmark') {
+      const response = await chrome.runtime.sendMessage({ type: 'SPECIAL_SAVE_BOOKMARK', postId: id });
+      if (accountLabel() !== account) throw new Error('アカウントが変わりました。Xで保存状態を確認してください。');
+      if (!response?.ok || response.verified !== true) throw new Error(response?.error ?? 'Xのブックマーク追加の応答を確認できません。');
+      const updated = currentArticle(id, article);
+      if (updated) confirmedBookmarks.set(updated, { id, account });
+      return;
+    }
+    if (!clickable(target)) throw unavailable(label);
     target.click();
     for (let attempt = 0; attempt < 25; attempt++) {
-      await new Promise<void>(resolve => setTimeout(resolve, 100));
+      await delay();
       if (!enabled() || accountLabel() !== account) throw new Error('アカウントが変わりました。再度お試しください。');
       const updated = currentArticle(id, article);
       if (updated && control(updated, on)) return;
     }
-    throw new Error(`${label}の反映を確認できません。状態を確認して再試行してください。`);
+    throw unconfirmed(label);
   }
   async function save(button: HTMLButtonElement, status: HTMLElement, article: Element, id: string): Promise<void> {
     if (!enabled()) { cleanup(); return; }
@@ -155,23 +178,26 @@
     if (!enabled()) { cleanup(); return; }
     const root = document.querySelector('[data-testid="primaryColumn"]') ?? document.querySelector('main');
     if (!root) return;
+    const placedRows: Element[] = [];
     for (const article of Array.from(root.querySelectorAll('article'))) {
       const id = postId(article);
       const group = Array.from(article.querySelectorAll('[role="group"]')).filter(node => node.closest('article') === article && node.querySelector('[data-testid="reply"], [data-testid="like"], [data-testid="unlike"]')).pop();
       const existing = Array.from(article.querySelectorAll(`[${marker}]`)).find(node => node.closest('article') === article);
-      if (existing && existing.getAttribute(marker) === id && group) {
-        if (existing.parentElement !== group) group.appendChild(existing);
+      if (id && group && existing?.getAttribute(marker) === id) {
+        if (group.nextElementSibling !== existing) group.after(existing);
+        placedRows.push(existing);
         const status = existing.querySelector('[role="status"]');
-        if (status && specialStatus.has(id!)) status.textContent = specialStatus.get(id!)!;
+        const text = specialStatus.get(id);
+        if (status && text !== undefined && status.textContent !== text) status.textContent = text;
         refresh(existing.querySelector('button')!, article); continue;
       }
       existing?.remove();
       if (!id || !group) continue;
       const row = document.createElement('div'); row.setAttribute(marker, id);
-      row.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0;font:inherit;color:inherit;';
+      row.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;gap:4px;box-sizing:border-box;width:100%;min-width:0;grid-column:1 / -1;white-space:normal;overflow-wrap:anywhere;font:inherit;color:inherit;';
       const button = document.createElement('button'); button.type = 'button'; button.textContent = '特別保存';
       button.setAttribute('aria-label', 'この投稿にいいねとブックマークを付ける');
-      button.style.cssText = 'border:1px solid currentColor;border-radius:16px;background:transparent;color:inherit;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer;';
+      button.style.cssText = 'border:1px solid currentColor;border-radius:16px;background:transparent;color:inherit;padding:4px min(12px, 5%);box-sizing:border-box;max-width:100%;white-space:normal;overflow-wrap:anywhere;font:inherit;font-size:13px;cursor:pointer;';
       const status = document.createElement('span'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); status.style.cssText = 'font-size:12px;overflow-wrap:anywhere;';
       status.textContent = specialStatus.get(id) ?? '';
       row.append(button, status);
@@ -183,10 +209,18 @@
       row.addEventListener('click', event => event.stopPropagation());
       button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); if (!button.disabled) void save(button, status, article, id); });
       localButton.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); if (!localButton.disabled) void localSave(localButton, localStatus, article, id); });
-      group.appendChild(row); refresh(button, article);
+      group.after(row); refresh(button, article);
+      placedRows.push(row);
     }
+    // Read computed styles together before changing which parents wrap.
+    const horizontalRows = new Set(placedRows.filter(row => {
+      const { display, flexDirection } = getComputedStyle(row.parentElement!);
+      return (display === 'flex' || display === 'inline-flex') && flexDirection.startsWith('row');
+    }));
+    for (const row of placedRows) row.toggleAttribute(wrapMarker, horizontalRows.has(row));
   }
-  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-testid'] });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-testid', 'class', 'style'] });
   document.addEventListener('visibilitychange', check);
+  window.addEventListener('resize', schedule);
   scan();
 })();

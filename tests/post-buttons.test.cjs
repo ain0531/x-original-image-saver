@@ -7,10 +7,24 @@ function buttonHarness(active = true, selections = {}) {
   class Element {
     constructor(tag) { this.tag = tag; this.children = []; this.attributes = {}; this.style = {}; this.listeners = {}; this.isConnected = true; }
     get parentElement() { return this.parent; }
+    get nextElementSibling() {
+      const siblings = this.parent?.children ?? [];
+      return siblings[siblings.indexOf(this) + 1] ?? null;
+    }
     append(...nodes) { for (const node of nodes) { if (node.parent) node.parent.children = node.parent.children.filter(child => child !== node); node.parent = this; this.children.push(node); } }
-    appendChild(node) { this.append(node); }
+    after(node) {
+      this.parent.append(node);
+      const siblings = this.parent.children;
+      siblings.pop();
+      siblings.splice(siblings.indexOf(this) + 1, 0, node);
+    }
     setAttribute(key, value) { this.attributes[key] = value; }
     getAttribute(key) { return this.attributes[key] ?? null; }
+    toggleAttribute(key, force) { if (force) this.setAttribute(key, ''); else delete this.attributes[key]; }
+    matches(selector) {
+      const attribute = selector.match(/^:has\(> \[([^\]]+)\]\)$/)?.[1];
+      return this.children.some(child => child.getAttribute(attribute) !== null);
+    }
     closest(tag) { return this.tag === tag ? this : this.parent?.closest(tag) ?? null; }
     querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
     querySelectorAll(selector) {
@@ -40,26 +54,43 @@ function buttonHarness(active = true, selections = {}) {
     return article;
   };
   const articles = [make('101')], timeouts = new Map(), intervals = [], requests = [];
+  const overlays = new Element('div');
   let observer, nextTimer = 0;
   const document = {
     documentElement: {}, querySelector: () => ({ querySelectorAll: () => articles }),
-    querySelectorAll: selector => articles.flatMap(article => article.querySelectorAll(selector)),
+    querySelectorAll: selector => [...overlays.querySelectorAll(selector), ...articles.flatMap(article => article.querySelectorAll(selector))],
     createElement: tag => new Element(tag), addEventListener() {}, removeEventListener() {},
   };
   const chrome = { storage: { local: { get: async () => ({ specialSaveBookmarkFolders: selections }) }, onChanged: { addListener() {} } }, runtime: { id: 'test', getManifest: () => { if (!active) throw new Error('Extension context invalidated'); return {}; }, sendMessage: async message => { requests.push(message); throw new Error('No download messages allowed'); } } };
   class Observer { constructor(callback) { this.callback = callback; observer = this; } observe() {} disconnect() { this.disconnected = true; } }
-  const context = vm.createContext({ document, chrome, location: { href: 'https://x.com/home' }, URL, MutationObserver: Observer,
+  const listeners = new Map();
+  const window = {
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type); },
+  };
+  const context = vm.createContext({ document, chrome, window, Element, location: { href: 'https://x.com/home' }, URL, MutationObserver: Observer,
+    getComputedStyle: element => ({ display: 'block', flexDirection: 'row', ...element.style }),
     setInterval: callback => { intervals.push(callback); return intervals.length; }, clearInterval() {},
     setTimeout: (callback, ms) => { const id = ++nextTimer; if (ms === 100) queueMicrotask(callback); else timeouts.set(id, callback); return id; }, clearTimeout: id => timeouts.delete(id),
   });
   vm.runInContext(fs.readFileSync('dist/post-buttons.js', 'utf8'), context);
-  return { articles, requests, document, chrome, make, get observer() { return observer; }, set active(value) { active = value; }, tick: () => intervals[0](), mutate() { observer.callback(); for (const [id, callback] of [...timeouts]) { timeouts.delete(id); callback(); } } };
+  const runScheduled = () => {
+    for (const [id, callback] of [...timeouts]) { timeouts.delete(id); callback(); }
+  };
+  return {
+    articles, requests, document, chrome, make, overlays, listeners, get observer() { return observer; },
+    set active(value) { active = value; }, tick: () => intervals[0](),
+    mutate(records = [{ type: 'childList' }]) { observer.callback(records); runScheduled(); },
+    resize() { listeners.get('resize')(); runScheduled(); },
+  };
 }
 const rows = article => article.querySelectorAll('[data-x-original-save]');
-test('button is in the action row, follows new posts, likes and bookmarks only the clicked post', async () => {
+test('save row immediately follows the action group and targets only the clicked post', async () => {
   const h = buttonHarness();
   assert.equal(rows(h.articles[0]).length, 1);
-  assert.equal(rows(h.articles[0])[0].parentElement.getAttribute('role'), 'group');
+  const group = h.articles[0].controls.like.parentElement;
+  assert.equal(group.nextElementSibling, rows(h.articles[0])[0]);
+  assert.equal(rows(group).length, 0);
   h.mutate(); assert.equal(rows(h.articles[0]).length, 1);
   h.articles.push(h.make('202')); h.mutate();
   const row = rows(h.articles[1])[0], button = row.children[0], status = row.children[1];
@@ -69,6 +100,53 @@ test('button is in the action row, follows new posts, likes and bookmarks only t
   assert.equal(button.getAttribute('aria-pressed'), 'true'); assert.equal(button.textContent, '特別保存済み');
   assert.equal(status.textContent, 'いいね・ブックマーク済み'); assert.equal(button.disabled, false);
   button.click(); await flush(); assert.deepEqual(h.articles[1].clicks, ['like', 'bookmark']);
+});
+test('redrawing the action group moves the same save row directly after it', async () => {
+  const h = buttonHarness(), article = h.articles[0], row = rows(article)[0];
+  const previousGroup = article.controls.like.parentElement;
+  const replacementParent = h.document.createElement('div');
+  const replacementGroup = h.document.createElement('div');
+  const footer = h.document.createElement('div');
+  replacementParent.style.display = 'flex';
+  replacementGroup.setAttribute('role', 'group');
+  previousGroup.remove();
+  replacementGroup.append(article.controls.like, article.controls.bookmark);
+  replacementParent.append(replacementGroup, footer);
+  article.append(replacementParent);
+  row.children[3].textContent = '保存結果';
+
+  h.mutate();
+  assert.deepEqual(replacementParent.children, [replacementGroup, row, footer]);
+  assert.equal(rows(article).length, 1);
+  assert.equal(row.children[3].textContent, '保存結果');
+  assert.equal(row.getAttribute('data-x-original-save-wrap'), '');
+  assert.match(row.style.cssText, /(?:^|;)width:100%;/);
+  assert.match(row.children[0].style.cssText, /max-width:100%;.*overflow-wrap:anywhere/);
+
+  replacementGroup.after = () => assert.fail('the save row is already in position');
+  h.mutate();
+  row.children[0].click(); await flush();
+  assert.deepEqual(article.clicks, ['like', 'bookmark']);
+});
+test('manifest CSS wraps only horizontal flex parents, including after a layout change', () => {
+  const script = require('../manifest.json').content_scripts.find(entry => entry.js.includes('dist/post-buttons.js'));
+  const css = fs.readFileSync(script.css[0], 'utf8');
+  assert.match(css, /:has\(> \[data-x-original-save\]\[data-x-original-save-wrap\]\)\s*\{\s*flex-wrap:\s*wrap/);
+
+  const h = buttonHarness(), parent = h.articles[0], row = rows(parent)[0];
+  const marker = 'data-x-original-save-wrap';
+  assert.equal(row.getAttribute(marker), null);
+  parent.style.display = 'inline-flex';
+  parent.style.flexDirection = 'row-reverse';
+  h.mutate([{ type: 'attributes', attributeName: 'style', target: parent }]);
+  assert.equal(row.getAttribute(marker), '');
+
+  parent.style.flexDirection = 'column';
+  h.resize();
+  assert.equal(row.getAttribute(marker), null);
+  parent.style.flexDirection = 'column-reverse';
+  h.mutate();
+  assert.equal(row.getAttribute(marker), null);
 });
 test('existing like is preserved, bookmark alone is added, and native changes update state', async () => {
   const h = buttonHarness(), article = h.articles[0], button = rows(article)[0].children[0];
@@ -86,15 +164,64 @@ test('partial failure is reported and retry does not undo the successful action'
   article.controls.bookmark.fail = false; row.children[0].click(); await flush();
   assert.deepEqual(article.clicks, ['like', 'bookmark', 'bookmark']); assert.deepEqual(h.requests, []);
 });
-test('missing controls report failure without downloading', async () => {
+test('missing controls use the bookmark fallback and report an unconfirmed response', async () => {
   const h = buttonHarness(), article = h.articles[0], row = rows(article)[0];
+  h.chrome.runtime.sendMessage = async message => { h.requests.push(message); return { ok: true }; };
   article.controls.bookmark.remove(); row.children[0].click(); await flush();
-  assert.match(row.children[1].textContent, /ブックマークの操作ボタンを確認できません/);
-  assert.deepEqual(h.requests, []);
+  assert.match(row.children[1].textContent, /ブックマーク追加の応答を確認できません/);
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].type, 'SPECIAL_SAVE_BOOKMARK');
+  assert.equal(row.children[0].getAttribute('aria-pressed'), 'false');
+});
+test('a share menu with a normal bookmark action stays closed while fallback and folder registration run', async () => {
+  const h = buttonHarness(true, { login: { id: '10', name: '資料' } });
+  h.articles.push(h.make('202')); h.mutate();
+  const article = h.articles[1], row = rows(article)[0];
+  article.controls.bookmark.remove();
+  const share = h.document.createElement('button');
+  share.setAttribute('data-testid', 'share');
+  article.controls.like.parentElement.append(share);
+  const menu = h.document.createElement('div'), item = h.document.createElement('div');
+  menu.setAttribute('role', 'menu');
+  item.setAttribute('role', 'menuitem');
+  item.textContent = 'ブックマークに追加';
+  item.listeners.click = () => article.clicks.push('menuBookmark');
+  menu.append(item);
+  share.listeners.click = () => { article.clicks.push('share'); h.overlays.append(menu); };
+
+  h.chrome.runtime.sendMessage = async message => {
+    h.requests.push(message);
+    return message.type === 'SPECIAL_SAVE_BOOKMARK' ? { ok: true, verified: true }
+      : { ok: true, configured: true, folder: { id: '10', name: '資料' } };
+  };
+  row.children[0].click(); await flush();
+  assert.deepEqual(article.clicks, ['like']);
+  assert.deepEqual(h.articles[0].clicks, []);
+  assert.equal(h.overlays.children.length, 0);
+  assert.deepEqual(h.requests.map(({ type, postId }) => [type, postId]), [
+    ['SPECIAL_SAVE_BOOKMARK', '202'], ['SPECIAL_SAVE_FOLDER', '202'],
+  ]);
+  assert.match(row.children[1].textContent, /フォルダ「資料」に登録済み/);
+});
+test('a detail bookmark failure stays visible and prevents folder registration', async () => {
+  const h = buttonHarness(true, { login: { id: '10', name: '資料' } });
+  const article = h.articles[0], row = rows(article)[0];
+  const error = '投稿詳細にブックマークボタンが見つかりません。';
+  article.controls.bookmark.remove();
+  h.chrome.runtime.sendMessage = async message => {
+    h.requests.push(message);
+    return { ok: false, error };
+  };
+  row.children[0].click(); await flush(); h.mutate();
+  assert.deepEqual(h.requests.map(({ type, postId }) => [type, postId]), [['SPECIAL_SAVE_BOOKMARK', '101']]);
+  assert.deepEqual(article.clicks, ['like']);
+  assert.equal(row.children[1].textContent, error);
+  assert.equal(row.children[0].getAttribute('aria-pressed'), 'false');
 });
 test('disabling extension removes its buttons and disconnects the observer', () => {
   const h = buttonHarness(); h.active = false; h.tick();
   assert.equal(h.document.querySelectorAll('[data-x-original-save]').length, 0); assert.equal(h.observer.disconnected, true);
+  assert.equal(h.listeners.has('resize'), false);
   const disabled = buttonHarness(false); assert.equal(disabled.document.querySelectorAll('[data-x-original-save]').length, 0);
 });
 

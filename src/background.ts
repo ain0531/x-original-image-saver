@@ -18,12 +18,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const trustedPost = sender.id === chrome.runtime.id && sender.frameId === 0 && Number.isInteger(sender.tab?.id) && isXPage(sender.url ?? '') && isXPage(sender.tab?.url ?? '');
   const trustedPanel = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL('sidepanel.html');
   const trustedOptions = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL('options.html');
-  if (['LIST_BOOKMARK_FOLDERS', 'SET_BOOKMARK_FOLDER', 'CLEAR_BOOKMARK_FOLDERS', 'SPECIAL_SAVE_FOLDER'].includes(message?.type)) {
-    const post = message.type === 'SPECIAL_SAVE_FOLDER';
+  if (['LIST_BOOKMARK_FOLDERS', 'SET_BOOKMARK_FOLDER', 'CLEAR_BOOKMARK_FOLDERS', 'SPECIAL_SAVE_FOLDER', 'SPECIAL_SAVE_BOOKMARK'].includes(message?.type)) {
+    const bookmark = message.type === 'SPECIAL_SAVE_BOOKMARK';
+    const post = bookmark || message.type === 'SPECIAL_SAVE_FOLDER';
     const allowed = post ? trustedPost && typeof message.postId === 'string' && /^\d+$/.test(message.postId)
       : trustedOptions && (message.type === 'CLEAR_BOOKMARK_FOLDERS' || Number.isInteger(message.tabId) && message.tabId >= 0 && (message.type !== 'SET_BOOKMARK_FOLDER' || typeof message.account === 'string' && typeof message.folderId === 'string' && /^(?:\d+)?$/.test(message.folderId)));
     if (!allowed) { sendResponse({ ok: false, error: 'この画面からの要求は受け付けられません。' }); return false; }
-    const operation = message.type === 'CLEAR_BOOKMARK_FOLDERS' ? bookmarkFolders.clear() : post ? bookmarkFolders.add(sender.tab!.id!, message.postId)
+    const operation = message.type === 'CLEAR_BOOKMARK_FOLDERS' ? bookmarkFolders.clear()
+      : bookmark ? bookmarkFolders.bookmark(sender.tab!.id!, message.postId) : post ? bookmarkFolders.add(sender.tab!.id!, message.postId)
       : message.type === 'LIST_BOOKMARK_FOLDERS' ? bookmarkFolders.list(message.tabId)
       : bookmarkFolders.select(message.tabId, message.account, message.folderId);
     void operation.then(result => sendResponse({ ok: true, ...result }), error => sendResponse({ ok: false, error: errorText(error) }));
