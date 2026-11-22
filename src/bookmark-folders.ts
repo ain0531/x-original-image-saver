@@ -155,11 +155,11 @@ export class BookmarkFolders {
     const account = await this.settingsAccount(tabId, identity);
     const selected = await this.selection(account, identity.scope);
     if (!selected) return { configured: false };
-    const list = await this.run(tabId, 'list', identity);
-    const folder = (list.folders as BookmarkFolder[]).find(folder => folder.id === selected.id);
-    if (!folder) throw new Error('指定フォルダが見つかりません。オプションで保存先を選び直してください。');
-    const result = await this.run(tabId, 'add', identity, folder.id, postId);
+    // The destination was validated when selected. The reader verifies the exact
+    // folder and post after registration, without depending on an unfiltered list.
+    const result = await this.run(tabId, 'add', identity, selected.id, postId);
     if (result.verified !== true) throw new Error('指定フォルダ内への保存を確認できません。再試行してください。');
+    const folder = typeof result.folderName === 'string' ? { ...selected, name: result.folderName } : selected;
     return { configured: true, folder };
   }
 }

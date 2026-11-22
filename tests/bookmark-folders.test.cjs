@@ -105,15 +105,24 @@ test('refusals identify the stage, HTTP status and X code without exposing crede
 test('X code 29 timeouts on folder reads are retried, but mutations are not resent', async () => {
   const timeout = { body: { errors: [{ code: 29, message: 'Timeout: Unspecified' }] } };
   const h = folderReader(); await h.learn();
+  const delays = [];
+  h.context.setTimeout = (callback, ms) => {
+    if (ms === 15000) return setTimeout(callback, ms);
+    delays.push(ms);
+    return setTimeout(callback, 0);
+  };
   h.replies.push(timeout, timeout, { body: list([{ id: '10', name: '資料' }]) });
   assert.equal((await h.run('list')).folders[0].id, '10'); assert.equal(h.calls.length, 3);
   h.calls.length = 0;
   h.replies.push({ body: { data: { bookmark_collection_tweet_put: 'Done' } } }, timeout, { body: list([{ id: '10', name: '資料', contains_requested_tweet: true }]) });
   assert.equal((await h.run('add', '10', '202')).verified, true); assert.equal(h.calls.length, 3);
   h.calls.length = 0;
-  h.replies.push(timeout, timeout, timeout, timeout);
+  delays.length = 0;
+  h.replies.push(timeout, timeout, timeout, timeout, timeout);
   const exhausted = await h.run('list');
-  assert.equal(exhausted.ok, false); assert.match(exhausted.error, /フォルダ一覧取得.*code 29/); assert.equal(h.calls.length, 4);
+  assert.equal(exhausted.ok, false); assert.match(exhausted.error, /フォルダ一覧取得.*code 29.*回復/); assert.equal(h.calls.length, 5);
+  assert.deepEqual(delays, [500, 1500, 3000, 6000]);
+  assert.ok(h.calls.every(call => call.init.cache === 'no-store'));
   h.calls.length = 0; h.replies.length = 0;
   h.replies.push(timeout);
   assert.equal((await h.run('add', '10', '202')).ok, false); assert.equal(h.calls.length, 1);
@@ -228,8 +237,10 @@ test('worker settings and registration use verified login and sender tab, keepin
   assert.equal(listed.ok, true);
   const selected = await h.request({ type: 'SET_BOOKMARK_FOLDER', tabId: 1, account: listed.account, folderId: '10' }, optionsSender);
   assert.equal(selected.selected.name, '資料');
+  calls.length = 0;
   const saved = await h.request({ type: 'SPECIAL_SAVE_FOLDER', postId: '202', tabId: 999, folderId: '999' }, postSender);
   assert.equal(saved.ok, true); assert.equal(saved.configured, true);
+  assert.deepEqual(calls.map(call => call.args[0]), ['add']);
   const mutation = calls.at(-1); assert.equal(mutation.target.tabId, 1); assert.equal(mutation.args[2], '10'); assert.equal(mutation.args[3], '202');
   assert.equal(h.calls.length, 0);
 });
@@ -288,14 +299,20 @@ test('public operation templates work on a different X tab without transferring 
   assert.equal((await foreign.window.__xOriginalBookmarkFolders('add', 'csrf-test', '10', '202', forged)).ok, false);
   assert.equal(foreign.calls.length, 0);
 });
-test('deleted folders and an account change in the worker never trigger registration', async () => {
+test('a rejected destination and an account change in the worker are reported as failures', async () => {
   const { h, calls } = folderWorker();
   const listed = await h.request({ type: 'LIST_BOOKMARK_FOLDERS', tabId: 1 }, optionsSender);
   await h.request({ type: 'SET_BOOKMARK_FOLDER', tabId: 1, account: listed.account, folderId: '10' }, optionsSender);
-  h.chrome.scripting.executeScript = async options => { if (options.files) return []; calls.push(options); return [{ result: { ok: true, folders: [] } }]; };
+  h.chrome.scripting.executeScript = async options => {
+    if (options.files) return [];
+    calls.push(options);
+    return [{ result: { ok: false, error: 'Xのフォルダ登録に失敗しました。' } }];
+  };
   calls.length = 0;
-  assert.equal((await h.request({ type: 'SPECIAL_SAVE_FOLDER', postId: '202' }, postSender)).ok, false);
-  assert.equal(calls.filter(call => call.args[0] === 'add').length, 0);
+  const rejected = await h.request({ type: 'SPECIAL_SAVE_FOLDER', postId: '202' }, postSender);
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /フォルダ登録に失敗/);
+  assert.deepEqual(calls.map(call => call.args[0]), ['add']);
   h.chrome.scripting.executeScript = async options => { if (options.files) return []; h.auth = 'different-account'; return [{ result: { ok: true, folders: [{ id: '10', name: '資料' }] } }]; };
   assert.equal((await h.request({ type: 'LIST_BOOKMARK_FOLDERS', tabId: 1 }, optionsSender)).ok, false);
 });

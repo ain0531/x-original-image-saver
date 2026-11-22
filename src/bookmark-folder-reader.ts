@@ -1,7 +1,7 @@
 // MAIN world: use the logged-in Web client's configuration. Never export credentials.
 (() => {
   const host = window as any;
-  if (host.__xOriginalBookmarkFolders?.version === 9) return;
+  if (host.__xOriginalBookmarkFolders?.version === 10) return;
   const request = window.fetch.bind(window);
   type Config = { url: string; variables: Record<string, unknown>; features?: Record<string, boolean> };
   let headers: Headers | undefined;
@@ -109,12 +109,15 @@
   // X intermittently answers folder reads with GraphQL code 29 "Timeout" (HTTP 200).
   // Reads are idempotent, so retry those with backoff; mutations are never resent.
   const transient = (errors: any[]) => errors.length > 0 && errors.every(error => String(error?.extensions?.code ?? error?.code) === '29');
-  async function json(url: string, init: RequestInit, stage: string, usable: (body: any) => boolean): Promise<any> {
-    const delays = init.method && init.method !== 'GET' ? [] : [500, 1500, 3000];
+  const hasFolderItems = (body: any) => Array.isArray(body?.data?.viewer?.user_results?.result?.bookmark_collections_slice?.items);
+  async function json(url: string, init: RequestInit, stage: string, usable: (body: any) => boolean, check: () => void): Promise<any> {
+    const delays = init.method && init.method !== 'GET' ? [] : [500, 1500, 3000, 6000];
     for (let attempt = 0; ; attempt++) {
+      check();
       try { return await jsonOnce(url, init, stage, usable); }
       catch (error) {
-        if (!(error instanceof TransientError) || attempt >= delays.length) throw error;
+        if (!(error instanceof TransientError) || !delays.length) throw error;
+        if (attempt >= delays.length) throw new Error(`${error.message}。Xの応答が回復してから再試行してください。`);
         await new Promise<void>(resolve => setTimeout(resolve, delays[attempt]));
       }
     }
@@ -234,7 +237,7 @@
           if (cursor) variables.cursor = cursor;
           url.searchParams.set('variables', JSON.stringify(variables));
           if (config.features) url.searchParams.set('features', JSON.stringify(config.features));
-          const body = await json(url.href, { credentials: 'include', headers }, 'フォルダ一覧取得', value => Array.isArray(value?.data?.viewer?.user_results?.result?.bookmark_collections_slice?.items)); check();
+          const body = await json(url.href, { credentials: 'include', headers, cache: 'no-store' }, 'フォルダ一覧取得', hasFolderItems, check); check();
           checkViewer(body);
           const slice = body.data?.viewer?.user_results?.result?.bookmark_collections_slice;
           if (!Array.isArray(slice?.items)) throw new Error('フォルダ一覧を確認できません。Xのブックマーク画面で利用状態を確認してください。');
@@ -263,7 +266,7 @@
       if (!listConfig) throw new Error('フォルダ登録を確認するための情報を取得できません。');
       check();
       const mutationHeaders = new Headers(headers); mutationHeaders.set('content-type', 'application/json');
-      const body = await json(config.url, { method: 'POST', credentials: 'include', headers: mutationHeaders, body: JSON.stringify({ variables: { bookmark_collection_id: folderId, tweet_id: postId }, ...(config.features ? { features: config.features } : {}), queryId: new URL(config.url).pathname.split('/')[4] }) }, 'フォルダ登録', value => value?.data?.bookmark_collection_tweet_put === 'Done');
+      const body = await json(config.url, { method: 'POST', credentials: 'include', headers: mutationHeaders, body: JSON.stringify({ variables: { bookmark_collection_id: folderId, tweet_id: postId }, ...(config.features ? { features: config.features } : {}), queryId: new URL(config.url).pathname.split('/')[4] }) }, 'フォルダ登録', value => value?.data?.bookmark_collection_tweet_put === 'Done', check);
       check();
       if (body.data?.bookmark_collection_tweet_put !== 'Done') throw new Error('指定フォルダへの登録を確認できません。Xで状態を確認して再試行してください。');
       // X's native folder picker requests tweet_id and reads contains_requested_tweet.
@@ -276,11 +279,13 @@
           const url = new URL(listConfig.url);
           url.searchParams.set('variables', JSON.stringify({ tweet_id: postId, ...(cursor ? { cursor } : {}) }));
           if (listConfig.features) url.searchParams.set('features', JSON.stringify(listConfig.features));
-          const verified = await json(url.href, { credentials: 'include', headers, cache: 'no-store' }, 'フォルダ登録確認', value => Array.isArray(value?.data?.viewer?.user_results?.result?.bookmark_collections_slice?.items)); check();
+          const verified = await json(url.href, { credentials: 'include', headers, cache: 'no-store' }, 'フォルダ登録確認', hasFolderItems, check); check();
           checkViewer(verified);
           const slice = verified.data?.viewer?.user_results?.result?.bookmark_collections_slice;
           const folder = Array.isArray(slice?.items) ? slice.items.find((item: { id?: unknown; contains_requested_tweet?: unknown }) => item.id === folderId) : undefined;
-          if (folder?.contains_requested_tweet === true) return { ok: true, verified: true };
+          if (folder?.contains_requested_tweet === true) {
+            return { ok: true, verified: true, ...(typeof folder.name === 'string' ? { folderName: folder.name } : {}), templates: publicTemplates() };
+          }
           if (folder) break;
           cursor = slice?.slice_info?.next_cursor ?? slice?.next_cursor;
           if (!cursor || cursor === '0') break;
@@ -293,7 +298,7 @@
     } catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
     finally { busy = false; }
   };
-  host.__xOriginalBookmarkFolders.version = 9;
+  host.__xOriginalBookmarkFolders.version = 10;
   host.__xOriginalBookmarkOnDetail = async (id: string, csrf: string) => {
     const initial = session();
     const isTarget = () => location.pathname.match(/\/status\/(\d+)\/?$/)?.[1] === id;
